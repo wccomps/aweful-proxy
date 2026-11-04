@@ -3,12 +3,5 @@
   "internal_mask": "192.168.220.",
   "external_mask": "10.100.1xx.",
   "team_dns_server_last_octet": "132",
-  "team_domain_name": "acme.com",
-  "base_socks_port": 1080,
-  "http_listen_addr": ":8080",
-  "dns_timeout_ms": 2000,
-  "dial_timeout_ms": 5000,
-  "idle_timeout_sec": 300,
-  "static_hosts_mode": "fallback",
-  "static_hosts": {}
+  "team_domain_name": "example.com"
 }
