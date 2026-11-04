@@ -87,21 +87,32 @@ func TestInvalidConfigsRejected(t *testing.T) {
 	}
 }
 
-func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.NumberOfTeams = 6
-	cfg.InternalMask = "192.168.220."
-	cfg.ExternalMask = "10.100.1xx."
-	cfg.TeamDNSServerLastOctet = 132
-	cfg.TeamDomainName = "acme.com"
-	cfg.StaticHosts = map[string]int{
-		"mail.acme.com": 50,
+func TestParseTeamUsername(t *testing.T) {
+	valid := map[string]int{
+		"team1":   1,
+		"team01":  1,
+		"TEAM20":  20,
+		"team-6":  6,
+		"team_06": 6,
+		"6":       6,
+		"06":      6,
 	}
-	cfg.normalize()
+	for input, want := range valid {
+		got, err := ParseTeamUsername(input, 20)
+		if err != nil || got != want {
+			t.Fatalf("ParseTeamUsername(%q) = (%d, %v), want (%d, nil)", input, got, err, want)
+		}
+	}
 
-	resolver := NewResolver(cfg)
+	invalid := []string{"", "team", "team0", "team21", "-1", "_1", "team-_1", "+1", "admin"}
+	for _, input := range invalid {
+		if got, err := ParseTeamUsername(input, 20); err == nil {
+			t.Fatalf("ParseTeamUsername(%q) = %d, expected error", input, got)
+		}
+	}
+}
 
-	// Start a local UDP DNS server simulating Team 6's DNS server.
+func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 	var (
 		dnsMu      sync.Mutex
 		failDNS    bool
@@ -137,10 +148,11 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 		_ = w.WriteMsg(m)
 	})
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.106.0.132:0")
 	if err != nil {
 		t.Fatalf("failed to bind UDP listener: %v", err)
 	}
+	dnsPort := pc.LocalAddr().(*net.UDPAddr).Port
 	dnsSrv := &dns.Server{PacketConn: pc, Handler: dnsHandler}
 	go func() {
 		_ = dnsSrv.ActivateAndServe()
@@ -149,20 +161,31 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 		_ = dnsSrv.Shutdown()
 	})
 
-	resolver.SetTeamDNSServerAddr(6, pc.LocalAddr().String())
+	cfg := DefaultConfig()
+	cfg.NumberOfTeams = 6
+	cfg.InternalMask = "192.168.220."
+	cfg.ExternalMask = "127.1xx.0."
+	cfg.TeamDNSServerLastOctet = 132
+	cfg.TeamDNSServerPort = dnsPort
+	cfg.TeamDomainName = "acme.com"
+	cfg.StaticHosts = map[string]int{
+		"mail.acme.com": 50,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
 
+	resolver := NewResolver(cfg)
 	ctx := context.Background()
 
-	// 1. Live DNS resolution + internal-to-external translation.
 	gotIP, err := resolver.Resolve(ctx, 6, "chat.acme.com")
 	if err != nil {
 		t.Fatalf("Resolve chat.acme.com failed: %v", err)
 	}
-	if gotIP != "10.100.106.25" {
-		t.Fatalf("expected 10.100.106.25, got %s", gotIP)
+	if gotIP != "127.106.0.25" {
+		t.Fatalf("expected 127.106.0.25, got %s", gotIP)
 	}
 
-	// 2. Simulate Team 6 DNS server going down -> should return LKG cached IP for chat.acme.com.
 	dnsMu.Lock()
 	failDNS = true
 	dnsMu.Unlock()
@@ -170,21 +193,19 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve chat.acme.com from LKG cache failed: %v", err)
 	}
-	if gotCached != "10.100.106.25" {
-		t.Fatalf("expected cached 10.100.106.25, got %s", gotCached)
+	if gotCached != "127.106.0.25" {
+		t.Fatalf("expected cached 127.106.0.25, got %s", gotCached)
 	}
 
-	// 3. With DNS still failing, resolve mail.acme.com via static_hosts fallback.
 	gotStatic, err := resolver.Resolve(ctx, 6, "mail.acme.com")
 	if err != nil {
 		t.Fatalf("Resolve mail.acme.com from static_hosts failed: %v", err)
 	}
-	if gotStatic != "10.100.106.50" {
-		t.Fatalf("expected static 10.100.106.50, got %s", gotStatic)
+	if gotStatic != "127.106.0.50" {
+		t.Fatalf("expected static 127.106.0.50, got %s", gotStatic)
 	}
 
-	// 4. Security check: poisoned DNS record returning another team's IP (10.100.101.25) or localhost (127.0.0.1).
-	for _, bad := range []string{"10.100.101.25", "127.0.0.1", "10.0.4.6"} {
+	for _, bad := range []string{"127.101.0.25", "127.0.0.1", "10.0.4.6"} {
 		dnsMu.Lock()
 		failDNS = false
 		poisonedIP = bad
@@ -195,12 +216,15 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 		}
 	}
 
-	// 5. Literal IPv4 translation and security enforcement.
-	translatedLiteral, err := resolver.TranslateAndValidateIPv4(6, "192.168.220.42")
-	if err != nil || translatedLiteral != "10.100.106.42" {
-		t.Fatalf("expected literal 192.168.220.42 -> 10.100.106.42, got %q (err=%v)", translatedLiteral, err)
+	if _, err := resolver.Resolve(ctx, 0, "mail.acme.com"); !errors.Is(err, ErrDestinationNotAllowed) {
+		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team 0, got %v", err)
 	}
-	if _, err := resolver.TranslateAndValidateIPv4(6, "10.100.105.42"); !errors.Is(err, ErrDestinationNotAllowed) {
+
+	translatedLiteral, err := resolver.TranslateAndValidateIPv4(6, "192.168.220.42")
+	if err != nil || translatedLiteral != "127.106.0.42" {
+		t.Fatalf("expected literal 192.168.220.42 -> 127.106.0.42, got %q (err=%v)", translatedLiteral, err)
+	}
+	if _, err := resolver.TranslateAndValidateIPv4(6, "127.105.0.42"); !errors.Is(err, ErrDestinationNotAllowed) {
 		t.Fatalf("expected cross-team literal IP to be rejected with ErrDestinationNotAllowed, got %v", err)
 	}
 	if _, err := resolver.TranslateAndValidateIPv4(6, "127.0.0.1"); !errors.Is(err, ErrDestinationNotAllowed) {
@@ -209,8 +233,6 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 }
 
 func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
-	// Start a mock upstream TCP server on 127.0.0.1 (which represents Team 1's external subnet "127.0.0." when xx -> 01 is mapped via 127.0.xx. or we test with 127.0.0.1 for team 1).
-	// Wait: with external_mask = "127.0.xx.", Team 1 is "127.0.01." -> net.ParseIP("127.0.01.1") or let's use "127.1xx.0." so Team 1 is "127.101.0.1" (valid loopback on Linux!).
 	upstreamLn, err := net.Listen("tcp", "127.101.0.25:0")
 	if err != nil {
 		t.Fatalf("failed to listen on 127.101.0.25: %v", err)
@@ -234,42 +256,48 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		}
 	}()
 
-	// Reserve a free port range for base_socks_port + 0..2.
-	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to probe free port: %v", err)
-	}
-	basePort := probeLn.Addr().(*net.TCPAddr).Port
-	_ = probeLn.Close()
-
 	cfg := DefaultConfig()
 	cfg.NumberOfTeams = 2
 	cfg.InternalMask = "192.168.220."
 	cfg.ExternalMask = "127.1xx.0."
 	cfg.TeamDNSServerLastOctet = 132
 	cfg.TeamDomainName = "acme.com"
-	cfg.BaseSocksPort = basePort
 	cfg.SocksListenHost = "127.0.0.1"
 	cfg.StaticHostsMode = "override"
 	cfg.StaticHosts = map[string]int{
 		"chat.acme.com": 25,
 	}
-	cfg.normalize()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("config validation failed: %v", err)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	resolver := NewResolver(cfg)
-	srv := NewSocks5Server(cfg, resolver)
-	if err := srv.Start(ctx); err != nil {
-		t.Fatalf("failed to start SOCKS5 server: %v", err)
+	var (
+		srv      *Socks5Server
+		basePort int
+	)
+	for attempt := 0; attempt < 10; attempt++ {
+		probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to probe free port: %v", err)
+		}
+		basePort = probeLn.Addr().(*net.TCPAddr).Port
+		_ = probeLn.Close()
+
+		cfg.BaseSocksPort = basePort
+		if err := cfg.Validate(); err != nil {
+			continue
+		}
+		resolver := NewResolver(cfg)
+		srv = NewSocks5Server(cfg, resolver)
+		if err := srv.Start(ctx); err == nil {
+			break
+		}
+	}
+	if srv == nil {
+		t.Fatal("failed to start SOCKS5 server after retries")
 	}
 	defer srv.Close()
 
-	// 1. Connect to Team 1 dedicated port (basePort + 1) using DOMAINNAME ("chat.acme.com").
 	t.Run("dedicated team port with domainname", func(t *testing.T) {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 2*time.Second)
 		if err != nil {
@@ -277,7 +305,6 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		}
 		defer conn.Close()
 
-		// Greeting: VER=5, NMETHODS=1, METHOD=0x00 (NoAuth)
 		if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 			t.Fatal(err)
 		}
@@ -289,7 +316,6 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 			t.Fatalf("unexpected auth response: %v", authResp)
 		}
 
-		// Request: CONNECT chat.acme.com:<upstreamPort>
 		host := "chat.acme.com"
 		req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
 		req = append(req, []byte(host)...)
@@ -320,7 +346,6 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		}
 	})
 
-	// 2. Connect to Team 1 dedicated port using literal internal IPv4 (192.168.220.25).
 	t.Run("dedicated team port with literal internal IPv4", func(t *testing.T) {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 2*time.Second)
 		if err != nil {
@@ -347,7 +372,6 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		}
 	})
 
-	// 3. Connect to multiplexed basePort with username "team1" (RFC 1929).
 	t.Run("multiplexed base port with RFC 1929 username team1", func(t *testing.T) {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort), 2*time.Second)
 		if err != nil {
@@ -364,7 +388,6 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 			t.Fatalf("expected method 0x02 on base port, got 0x%02x", authResp[1])
 		}
 
-		// RFC 1929 auth: VER=1, ULEN=5, UNAME="team1", PLEN=1, PASS="x"
 		_, _ = conn.Write([]byte{0x01, 0x05, 't', 'e', 'a', 'm', '1', 0x01, 'x'})
 		subResp := make([]byte, 2)
 		if _, err := io.ReadFull(conn, subResp); err != nil {
@@ -391,7 +414,6 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		}
 	})
 
-	// 4. Reject disallowed IP (10.0.4.6) on Team 1 port with REP = 0x02.
 	t.Run("reject disallowed IP with REP 0x02", func(t *testing.T) {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 2*time.Second)
 		if err != nil {
@@ -415,7 +437,6 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		}
 	})
 
-	// 5. Reject UDP ASSOCIATE (0x03) with REP = 0x07.
 	t.Run("reject UDP ASSOCIATE with REP 0x07", func(t *testing.T) {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 2*time.Second)
 		if err != nil {
@@ -448,11 +469,12 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 	cfg.TeamDNSServerLastOctet = 132
 	cfg.TeamDomainName = "acme.com"
 	cfg.BaseSocksPort = 1080
-	cfg.normalize()
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
 
 	handler := NewHTTPHandler(cfg)
 
-	// 1. GET /healthz
 	reqHealth := httptest.NewRequest(http.MethodGet, "http://10.0.4.15:8080/healthz", nil)
 	recHealth := httptest.NewRecorder()
 	handler.ServeHTTP(recHealth, reqHealth)
@@ -467,7 +489,6 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 		t.Fatalf("unexpected healthz body: %v", health)
 	}
 
-	// 2. GET /foxyproxy.json
 	reqFoxy := httptest.NewRequest(http.MethodGet, "http://10.0.4.15:8080/foxyproxy.json", nil)
 	recFoxy := httptest.NewRecorder()
 	handler.ServeHTTP(recFoxy, reqFoxy)

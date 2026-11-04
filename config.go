@@ -11,8 +11,7 @@ import (
 	"time"
 )
 
-// FlexibleOctet allows JSON configuration to specify the last octet as either
-// a string ("132") for compatibility with aweful-dns or an integer (132).
+// FlexibleOctet unmarshals a JSON string ("132", for aweful-dns compatibility) or integer (132).
 type FlexibleOctet int
 
 func (fo *FlexibleOctet) UnmarshalJSON(b []byte) error {
@@ -33,15 +32,12 @@ func (fo *FlexibleOctet) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (fo FlexibleOctet) MarshalJSON() ([]byte, error) {
-	return json.Marshal(strconv.Itoa(int(fo)))
-}
-
 type Config struct {
 	NumberOfTeams          int            `json:"number_of_teams"`
 	InternalMask           string         `json:"internal_mask"`
 	ExternalMask           string         `json:"external_mask"`
 	TeamDNSServerLastOctet FlexibleOctet  `json:"team_dns_server_last_octet"`
+	TeamDNSServerPort      int            `json:"team_dns_server_port"`
 	TeamDomainName         string         `json:"team_domain_name"`
 	BaseSocksPort          int            `json:"base_socks_port"`
 	SocksListenHost        string         `json:"socks_listen_host"`
@@ -56,14 +52,15 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		BaseSocksPort:   1080,
-		SocksListenHost: "0.0.0.0",
-		HTTPListenAddr:  ":8080",
-		DNSTimeoutMs:    2000,
-		DialTimeoutMs:   5000,
-		IdleTimeoutSec:  300,
-		StaticHostsMode: "fallback",
-		StaticHosts:     make(map[string]int),
+		TeamDNSServerPort: 53,
+		BaseSocksPort:     1080,
+		SocksListenHost:   "0.0.0.0",
+		HTTPListenAddr:    ":8080",
+		DNSTimeoutMs:      2000,
+		DialTimeoutMs:     5000,
+		IdleTimeoutSec:    300,
+		StaticHostsMode:   "fallback",
+		StaticHosts:       make(map[string]int),
 	}
 }
 
@@ -72,7 +69,7 @@ func LoadConfig(path string) (Config, error) {
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) || !hasEnvConfig() {
+			if !errors.Is(err, os.ErrNotExist) || os.Getenv("AWEFUL_PROXY_NUMBER_OF_TEAMS") == "" {
 				return cfg, fmt.Errorf("reading config file %s: %w", path, err)
 			}
 		} else if err := json.Unmarshal(data, &cfg); err != nil {
@@ -83,81 +80,53 @@ func LoadConfig(path string) (Config, error) {
 	if err := applyEnvOverrides(&cfg); err != nil {
 		return cfg, err
 	}
-	cfg.normalize()
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
 }
 
-func hasEnvConfig() bool {
-	return os.Getenv("AWEFUL_PROXY_NUMBER_OF_TEAMS") != ""
-}
-
 func applyEnvOverrides(cfg *Config) error {
-	if v := os.Getenv("AWEFUL_PROXY_NUMBER_OF_TEAMS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid AWEFUL_PROXY_NUMBER_OF_TEAMS: %w", err)
+	strBindings := []struct {
+		env    string
+		target *string
+	}{
+		{"AWEFUL_PROXY_INTERNAL_MASK", &cfg.InternalMask},
+		{"AWEFUL_PROXY_EXTERNAL_MASK", &cfg.ExternalMask},
+		{"AWEFUL_PROXY_TEAM_DOMAIN_NAME", &cfg.TeamDomainName},
+		{"AWEFUL_PROXY_SOCKS_LISTEN_HOST", &cfg.SocksListenHost},
+		{"AWEFUL_PROXY_HTTP_LISTEN_ADDR", &cfg.HTTPListenAddr},
+		{"AWEFUL_PROXY_ADVERTISE_HOST", &cfg.ProxyAdvertiseHost},
+		{"AWEFUL_PROXY_STATIC_HOSTS_MODE", &cfg.StaticHostsMode},
+	}
+	for _, b := range strBindings {
+		if v := os.Getenv(b.env); v != "" {
+			*b.target = v
 		}
-		cfg.NumberOfTeams = n
 	}
-	if v := os.Getenv("AWEFUL_PROXY_INTERNAL_MASK"); v != "" {
-		cfg.InternalMask = v
+
+	dnsOctet := int(cfg.TeamDNSServerLastOctet)
+	intBindings := []struct {
+		env    string
+		target *int
+	}{
+		{"AWEFUL_PROXY_NUMBER_OF_TEAMS", &cfg.NumberOfTeams},
+		{"AWEFUL_PROXY_TEAM_DNS_SERVER_LAST_OCTET", &dnsOctet},
+		{"AWEFUL_PROXY_BASE_SOCKS_PORT", &cfg.BaseSocksPort},
+		{"AWEFUL_PROXY_DNS_TIMEOUT_MS", &cfg.DNSTimeoutMs},
+		{"AWEFUL_PROXY_DIAL_TIMEOUT_MS", &cfg.DialTimeoutMs},
+		{"AWEFUL_PROXY_IDLE_TIMEOUT_SEC", &cfg.IdleTimeoutSec},
 	}
-	if v := os.Getenv("AWEFUL_PROXY_EXTERNAL_MASK"); v != "" {
-		cfg.ExternalMask = v
-	}
-	if v := os.Getenv("AWEFUL_PROXY_TEAM_DNS_SERVER_LAST_OCTET"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid AWEFUL_PROXY_TEAM_DNS_SERVER_LAST_OCTET: %w", err)
+	for _, b := range intBindings {
+		if v := os.Getenv(b.env); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s: %w", b.env, err)
+			}
+			*b.target = n
 		}
-		cfg.TeamDNSServerLastOctet = FlexibleOctet(n)
 	}
-	if v := os.Getenv("AWEFUL_PROXY_TEAM_DOMAIN_NAME"); v != "" {
-		cfg.TeamDomainName = v
-	}
-	if v := os.Getenv("AWEFUL_PROXY_BASE_SOCKS_PORT"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid AWEFUL_PROXY_BASE_SOCKS_PORT: %w", err)
-		}
-		cfg.BaseSocksPort = n
-	}
-	if v := os.Getenv("AWEFUL_PROXY_SOCKS_LISTEN_HOST"); v != "" {
-		cfg.SocksListenHost = v
-	}
-	if v := os.Getenv("AWEFUL_PROXY_HTTP_LISTEN_ADDR"); v != "" {
-		cfg.HTTPListenAddr = v
-	}
-	if v := os.Getenv("AWEFUL_PROXY_ADVERTISE_HOST"); v != "" {
-		cfg.ProxyAdvertiseHost = v
-	}
-	if v := os.Getenv("AWEFUL_PROXY_DNS_TIMEOUT_MS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid AWEFUL_PROXY_DNS_TIMEOUT_MS: %w", err)
-		}
-		cfg.DNSTimeoutMs = n
-	}
-	if v := os.Getenv("AWEFUL_PROXY_DIAL_TIMEOUT_MS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid AWEFUL_PROXY_DIAL_TIMEOUT_MS: %w", err)
-		}
-		cfg.DialTimeoutMs = n
-	}
-	if v := os.Getenv("AWEFUL_PROXY_IDLE_TIMEOUT_SEC"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("invalid AWEFUL_PROXY_IDLE_TIMEOUT_SEC: %w", err)
-		}
-		cfg.IdleTimeoutSec = n
-	}
-	if v := os.Getenv("AWEFUL_PROXY_STATIC_HOSTS_MODE"); v != "" {
-		cfg.StaticHostsMode = v
-	}
+	cfg.TeamDNSServerLastOctet = FlexibleOctet(dnsOctet)
 	return nil
 }
 
@@ -169,6 +138,9 @@ func (c *Config) normalize() {
 	if c.StaticHostsMode == "" {
 		c.StaticHostsMode = "fallback"
 	}
+	if c.TeamDNSServerPort == 0 {
+		c.TeamDNSServerPort = 53
+	}
 	normalizedHosts := make(map[string]int, len(c.StaticHosts))
 	for k, v := range c.StaticHosts {
 		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(k), "."))
@@ -179,14 +151,15 @@ func (c *Config) normalize() {
 	c.StaticHosts = normalizedHosts
 }
 
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
+	c.normalize()
 	if c.NumberOfTeams < 1 || c.NumberOfTeams > 99 {
 		return fmt.Errorf("number_of_teams must be between 1 and 99 (got %d)", c.NumberOfTeams)
 	}
 	if !isValidThreeOctetPrefix(c.InternalMask) {
 		return fmt.Errorf("internal_mask must be 3 IPv4 octets ending with a dot, e.g. \"192.168.220.\" (got %q)", c.InternalMask)
 	}
-	if !strings.Contains(c.ExternalMask, "xx") || ! strings.HasSuffix(c.ExternalMask, ".") {
+	if !strings.Contains(c.ExternalMask, "xx") || !strings.HasSuffix(c.ExternalMask, ".") {
 		return fmt.Errorf("external_mask must contain \"xx\" and end with a dot, e.g. \"10.100.1xx.\" (got %q)", c.ExternalMask)
 	}
 	for team := 1; team <= c.NumberOfTeams; team++ {
@@ -198,6 +171,9 @@ func (c Config) Validate() error {
 	dnsOctet := int(c.TeamDNSServerLastOctet)
 	if dnsOctet < 1 || dnsOctet > 254 {
 		return fmt.Errorf("team_dns_server_last_octet must be between 1 and 254 (got %d)", dnsOctet)
+	}
+	if c.TeamDNSServerPort < 1 || c.TeamDNSServerPort > 65535 {
+		return fmt.Errorf("team_dns_server_port must be between 1 and 65535 (got %d)", c.TeamDNSServerPort)
 	}
 	if c.TeamDomainName == "" {
 		return errors.New("team_domain_name is required")
@@ -233,16 +209,16 @@ func isValidThreeOctetPrefix(prefix string) bool {
 	return ip != nil && ip.To4() != nil && strings.Count(prefix, ".") == 3
 }
 
-// TeamExternalPrefix returns the 3-octet trailing-dot prefix for team N (1-based),
-// e.g. "10.100.106." when ExternalMask is "10.100.1xx." and team is 6.
 func (c Config) TeamExternalPrefix(team int) string {
-	teamStr := fmt.Sprintf("%02d", team)
-	return strings.Replace(c.ExternalMask, "xx", teamStr, 1)
+	return strings.Replace(c.ExternalMask, "xx", fmt.Sprintf("%02d", team), 1)
 }
 
-// TeamDNSServerAddr returns the ip:port of Team N's DNS server, e.g. "10.100.106.132:53".
 func (c Config) TeamDNSServerAddr(team int) string {
-	return fmt.Sprintf("%s%d:53", c.TeamExternalPrefix(team), int(c.TeamDNSServerLastOctet))
+	port := c.TeamDNSServerPort
+	if port == 0 {
+		port = 53
+	}
+	return fmt.Sprintf("%s%d:%d", c.TeamExternalPrefix(team), int(c.TeamDNSServerLastOctet), port)
 }
 
 func (c Config) DNSTimeout() time.Duration {

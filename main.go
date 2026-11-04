@@ -51,6 +51,9 @@ func main() {
 		Addr:              cfg.HTTPListenAddr,
 		Handler:           NewHTTPHandler(cfg),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

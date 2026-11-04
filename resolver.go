@@ -13,6 +13,8 @@ import (
 	"github.com/miekg/dns"
 )
 
+const maxLKGCacheEntries = 2048
+
 var (
 	ErrDestinationNotAllowed = errors.New("destination IP is outside team external subnet")
 	ErrHostNotFound          = errors.New("unable to resolve host")
@@ -23,47 +25,21 @@ type cacheKey struct {
 	host string
 }
 
-// DNSQueryFunc queries a DNS server (addr = ip:port) for A records of fqdn.
-type DNSQueryFunc func(ctx context.Context, serverAddr string, fqdn string) ([]net.IP, error)
-
 type Resolver struct {
-	cfg       Config
-	queryDNS  DNSQueryFunc
-	cacheMu   sync.RWMutex
-	lkgCache  map[cacheKey]string
-	dnsServer map[int]string
+	cfg      Config
+	cacheMu  sync.RWMutex
+	lkgCache map[cacheKey]string
 }
 
 func NewResolver(cfg Config) *Resolver {
-	r := &Resolver{
-		cfg:       cfg,
-		lkgCache:  make(map[cacheKey]string),
-		dnsServer: make(map[int]string, cfg.NumberOfTeams),
+	cfg.normalize()
+	return &Resolver{
+		cfg:      cfg,
+		lkgCache: make(map[cacheKey]string),
 	}
-	for t := 1; t <= cfg.NumberOfTeams; t++ {
-		r.dnsServer[t] = cfg.TeamDNSServerAddr(t)
-	}
-	r.queryDNS = r.defaultQueryDNS
-	return r
 }
 
-// SetTeamDNSServerAddr overrides the DNS server address (ip:port) for a specific team (useful in tests).
-func (r *Resolver) SetTeamDNSServerAddr(team int, addr string) {
-	r.cacheMu.Lock()
-	defer r.cacheMu.Unlock()
-	r.dnsServer[team] = addr
-}
-
-func (r *Resolver) teamDNSAddr(team int) string {
-	r.cacheMu.RLock()
-	defer r.cacheMu.RUnlock()
-	if addr, ok := r.dnsServer[team]; ok {
-		return addr
-	}
-	return r.cfg.TeamDNSServerAddr(team)
-}
-
-func (r *Resolver) defaultQueryDNS(ctx context.Context, serverAddr string, fqdn string) ([]net.IP, error) {
+func (r *Resolver) queryDNS(ctx context.Context, serverAddr string, fqdn string) ([]net.IP, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
 	msg.RecursionDesired = true
@@ -101,15 +77,15 @@ func (r *Resolver) defaultQueryDNS(ctx context.Context, serverAddr string, fqdn 
 	return ips, nil
 }
 
-// Resolve translates a hostname or literal IPv4 for a given team into a validated
-// external IPv4 address within Team N's subnet.
 func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, error) {
+	if team < 1 || team > r.cfg.NumberOfTeams {
+		return "", ErrDestinationNotAllowed
+	}
 	normalized := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	if normalized == "" {
 		return "", ErrHostNotFound
 	}
 
-	// If the caller passed a literal IP address inside a domain field, validate/translate it directly.
 	if ip := net.ParseIP(normalized); ip != nil {
 		if ip.To4() == nil {
 			return "", ErrDestinationNotAllowed
@@ -117,22 +93,25 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 		return r.TranslateAndValidateIPv4(team, ip.To4().String())
 	}
 
-	// 1. Static override mode: check static_hosts before querying team DNS.
 	if r.cfg.StaticHostsMode == "override" {
 		if ip, ok := r.lookupStaticHost(team, normalized); ok {
 			return ip, nil
 		}
 	}
 
-	// 2. Query Team N's DNS server.
-	serverAddr := r.teamDNSAddr(team)
+	serverAddr := r.cfg.TeamDNSServerAddr(team)
 	ips, dnsErr := r.queryDNS(ctx, serverAddr, normalized)
 	if dnsErr == nil && len(ips) > 0 {
 		var sawDisallowed bool
 		for _, ip := range ips {
 			translated, err := r.TranslateAndValidateIPv4(team, ip.String())
 			if err == nil {
-				r.setCached(team, normalized, translated)
+				r.cacheMu.Lock()
+				if len(r.lkgCache) >= maxLKGCacheEntries {
+					clear(r.lkgCache)
+				}
+				r.lkgCache[cacheKey{team: team, host: normalized}] = translated
+				r.cacheMu.Unlock()
 				return translated, nil
 			}
 			if errors.Is(err, ErrDestinationNotAllowed) {
@@ -150,7 +129,6 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 		}
 	}
 
-	// 3. Fallback to static_hosts (if in "fallback" mode) or last-known-good (LKG) cache.
 	if r.cfg.StaticHostsMode == "fallback" {
 		if ip, ok := r.lookupStaticHost(team, normalized); ok {
 			slog.Info("Using static_hosts fallback for host",
@@ -163,7 +141,10 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 		}
 	}
 
-	if cachedIP, ok := r.getCached(team, normalized); ok {
+	r.cacheMu.RLock()
+	cachedIP, ok := r.lkgCache[cacheKey{team: team, host: normalized}]
+	r.cacheMu.RUnlock()
+	if ok {
 		slog.Info("Using last-known-good cached DNS record",
 			"team", team,
 			"host", normalized,
@@ -179,8 +160,6 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 	return "", ErrHostNotFound
 }
 
-// TranslateAndValidateIPv4 rewrites InternalMask to Team N's ExternalMask prefix (if present)
-// and verifies that the final IPv4 address strictly belongs to Team N's external subnet (octets 1..254).
 func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, error) {
 	if team < 1 || team > r.cfg.NumberOfTeams {
 		return "", ErrDestinationNotAllowed
@@ -224,17 +203,4 @@ func (r *Resolver) lookupStaticHost(team int, normalizedHost string) (string, bo
 		return "", false
 	}
 	return fmt.Sprintf("%s%d", r.cfg.TeamExternalPrefix(team), octet), true
-}
-
-func (r *Resolver) getCached(team int, normalizedHost string) (string, bool) {
-	r.cacheMu.RLock()
-	defer r.cacheMu.RUnlock()
-	ip, ok := r.lkgCache[cacheKey{team: team, host: normalizedHost}]
-	return ip, ok
-}
-
-func (r *Resolver) setCached(team int, normalizedHost, translatedIP string) {
-	r.cacheMu.Lock()
-	defer r.cacheMu.Unlock()
-	r.lkgCache[cacheKey{team: team, host: normalizedHost}] = translatedIP
 }

@@ -18,10 +18,10 @@ The system SHALL also bind `base_socks_port` (e.g., `1080`) and support RFC 1929
 - **WHEN** a client connects to port `1080` using RFC 1929 authentication with username `"team6"` (or `"team06"` or `"6"`)
 - **THEN** authentication succeeds (`0x01 0x00`) and the connection is scoped to Team 6
 
-#### Scenario: Invalid team username on base port
+#### Scenario: Invalid team username or missing auth on base port
 - **GIVEN** `base_socks_port` is `1080` and `number_of_teams` is `20`
-- **WHEN** a client connects to port `1080` with no authentication or with username `"team99"`
-- **THEN** authentication fails (`0x01 0x01`) and the connection is closed
+- **WHEN** a client connects to port `1080` without offering RFC 1929 authentication, or authenticates with username `"team99"`
+- **THEN** method negotiation replies `0x05 0xFF` (when RFC 1929 is not offered) or authentication replies `0x01 0x01` (when username is out of range) and the connection is closed
 
 ### Requirement: SOCKS5 CONNECT Command and Address Types
 On a team-scoped connection, the system SHALL accept RFC 1928 `CONNECT` (`CMD = 0x01`) requests with `ATYP = 0x03` (`DOMAINNAME`) or `ATYP = 0x01` (`IPv4`). All other commands (`BIND`, `UDP ASSOCIATE`) and address types (`IPv6`) SHALL be rejected with standard SOCKS5 reply codes.

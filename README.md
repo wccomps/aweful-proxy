@@ -10,10 +10,10 @@ Multi-team Layer-4 SOCKS5 proxy and per-team DNS/NAT translator for WRCCDC / WCC
    - Binds one TCP port per team (`1081` = Team 1 .. `1100` = Team 20 when `base_socks_port` is `1080`).
    - Also binds a multiplexed base port (`1080`) supporting RFC 1929 SOCKS5 usernames (`team1`..`team20`).
 2. **Per-Team DNS & NAT Translation (`proxyDNS: true`):**
-   - When a browser or CLI tool connects to Team $N$'s SOCKS5 port and requests `chat.acme.com:443`, `aweful-proxy` queries Team $N$'s DNS server (`10.100.10N.132:53`).
-   - Translates the returned internal IP (`192.168.220.25`) to Team $N$'s external NAT IP (`10.100.10N.25`).
-   - Also translates literal internal IPv4 addresses (`192.168.220.25` -> `10.100.10N.25`).
-   - Enforces a strict subnet allowlist (`10.100.10N.1..254`) before dialing and pipes raw TCP bytes transparently.
+   - When a browser or CLI tool connects to Team $N$'s SOCKS5 port and requests `chat.acme.com:443`, `aweful-proxy` queries Team $N$'s DNS server (`10.100.1<NN>.132:53`).
+   - Translates the returned internal IP (`192.168.220.25`) to Team $N$'s external NAT IP (`10.100.1<NN>.25`).
+   - Also translates literal internal IPv4 addresses (`192.168.220.25` -> `10.100.1<NN>.25`).
+   - Enforces a strict subnet allowlist (`10.100.1<NN>.1..254`) before dialing and pipes raw TCP bytes transparently.
 3. **One-Click FoxyProxy Export (`/foxyproxy.json`):**
    - Exposes `GET /foxyproxy.json` on `:8080`, generating a ready-to-import FoxyProxy v8 JSON configuration containing all teams (`Team 01` .. `Team 20`) with `proxyDNS: true`.
    - Exposes `GET /healthz` on `:8080` for readiness/liveness probes.

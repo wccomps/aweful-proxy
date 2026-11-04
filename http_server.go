@@ -80,19 +80,39 @@ func NewHTTPHandler(cfg Config) http.Handler {
 }
 
 func resolveAdvertiseHost(cfg Config, r *http.Request) string {
-	if qHost := strings.TrimSpace(r.URL.Query().Get("host")); qHost != "" {
-		return qHost
-	}
 	if cfg.ProxyAdvertiseHost != "" {
 		return cfg.ProxyAdvertiseHost
 	}
+	if qHost := strings.TrimSpace(r.URL.Query().Get("host")); isValidHostOrIP(qHost) {
+		return qHost
+	}
 	if r.Host != "" {
+		candidate := r.Host
 		if h, _, err := net.SplitHostPort(r.Host); err == nil && h != "" {
-			return h
+			candidate = h
 		}
-		return r.Host
+		if isValidHostOrIP(candidate) {
+			return candidate
+		}
 	}
 	return "127.0.0.1"
+}
+
+func isValidHostOrIP(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	if ip := net.ParseIP(s); ip != nil {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !isAlphaNum && c != '.' && c != '-' {
+			return false
+		}
+	}
+	return s[0] != '.' && s[0] != '-' && s[len(s)-1] != '-'
 }
 
 func BuildFoxyProxyConfig(cfg Config, proxyHost string) FoxyProxyExport {

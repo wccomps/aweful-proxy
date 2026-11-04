@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,24 +30,26 @@ const (
 	atypIPv6   = 0x04
 
 	repSucceeded             = 0x00
-	repGeneralFailure        = 0x01
 	repNotAllowedByRuleset   = 0x02
 	repNetworkUnreachable    = 0x03
 	repHostUnreachable       = 0x04
 	repConnectionRefused     = 0x05
 	repCommandNotSupported   = 0x07
 	repAddressTypeNotSupport = 0x08
+
+	maxConcurrentConns = 1024
 )
 
-// ParseTeamUsername extracts the 1-based team number from a SOCKS5 username
-// such as "team1", "team01", "Team6", or "6".
 func ParseTeamUsername(username string, numberOfTeams int) (int, error) {
 	u := strings.ToLower(strings.TrimSpace(username))
-	u = strings.TrimPrefix(u, "team")
-	u = strings.TrimPrefix(u, "-")
-	u = strings.TrimPrefix(u, "_")
-	if u == "" {
-		return 0, fmt.Errorf("empty team identifier in username %q", username)
+	if after, ok := strings.CutPrefix(u, "team"); ok {
+		if strings.HasPrefix(after, "-") || strings.HasPrefix(after, "_") {
+			after = after[1:]
+		}
+		u = after
+	}
+	if u == "" || strings.HasPrefix(u, "+") || strings.HasPrefix(u, "-") {
+		return 0, fmt.Errorf("invalid team identifier in username %q", username)
 	}
 	team, err := strconv.Atoi(u)
 	if err != nil || team < 1 || team > numberOfTeams {
@@ -56,22 +59,24 @@ func ParseTeamUsername(username string, numberOfTeams int) (int, error) {
 }
 
 type Socks5Server struct {
-	cfg       Config
-	resolver  *Resolver
-	listeners []net.Listener
-	mu        sync.Mutex
-	wg        sync.WaitGroup
+	cfg         Config
+	resolver    *Resolver
+	listeners   []net.Listener
+	activeConns map[net.Conn]struct{}
+	connSem     chan struct{}
+	mu          sync.Mutex
+	wg          sync.WaitGroup
 }
 
 func NewSocks5Server(cfg Config, resolver *Resolver) *Socks5Server {
 	return &Socks5Server{
-		cfg:      cfg,
-		resolver: resolver,
+		cfg:         cfg,
+		resolver:    resolver,
+		activeConns: make(map[net.Conn]struct{}),
+		connSem:     make(chan struct{}, maxConcurrentConns),
 	}
 }
 
-// Start binds the multiplexed base port (base_socks_port) and all per-team ports
-// (base_socks_port + 1 .. base_socks_port + number_of_teams).
 func (s *Socks5Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -81,7 +86,7 @@ func (s *Socks5Server) Start(ctx context.Context) error {
 		addr := net.JoinHostPort(s.cfg.SocksListenHost, strconv.Itoa(port))
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			s.closeListenersLocked()
+			s.closeLocked()
 			return fmt.Errorf("listening on SOCKS5 port %d (team %d): %w", port, team, err)
 		}
 		s.listeners = append(s.listeners, ln)
@@ -98,17 +103,30 @@ func (s *Socks5Server) Start(ctx context.Context) error {
 
 func (s *Socks5Server) Close() error {
 	s.mu.Lock()
-	s.closeListenersLocked()
+	s.closeLocked()
 	s.mu.Unlock()
 	s.wg.Wait()
 	return nil
 }
 
-func (s *Socks5Server) closeListenersLocked() {
+func (s *Socks5Server) closeLocked() {
 	for _, ln := range s.listeners {
 		_ = ln.Close()
 	}
 	s.listeners = nil
+	for conn := range s.activeConns {
+		_ = conn.Close()
+	}
+}
+
+func (s *Socks5Server) trackConn(conn net.Conn, active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if active {
+		s.activeConns[conn] = struct{}{}
+	} else {
+		delete(s.activeConns, conn)
+	}
 }
 
 func (s *Socks5Server) acceptLoop(ctx context.Context, ln net.Listener, fixedTeam int) {
@@ -121,9 +139,20 @@ func (s *Socks5Server) acceptLoop(ctx context.Context, ln net.Listener, fixedTea
 			slog.Warn("SOCKS5 accept error", "team", fixedTeam, "err", err)
 			continue
 		}
+		select {
+		case s.connSem <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
+		s.trackConn(conn, true)
 		s.wg.Add(1)
 		go func(c net.Conn) {
-			defer s.wg.Done()
+			defer func() {
+				s.trackConn(c, false)
+				<-s.connSem
+				s.wg.Done()
+			}()
 			s.handleConnection(ctx, c, fixedTeam)
 		}(conn)
 	}
@@ -154,12 +183,7 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 		return
 	}
 
-	var translatedIP string
-	if atyp == atypIPv4 {
-		translatedIP, err = s.resolver.TranslateAndValidateIPv4(team, targetHost)
-	} else {
-		translatedIP, err = s.resolver.Resolve(ctx, team, targetHost)
-	}
+	translatedIP, err := s.resolver.Resolve(ctx, team, targetHost)
 	if err != nil {
 		if errors.Is(err, ErrDestinationNotAllowed) {
 			slog.Warn("SOCKS5 rejected disallowed destination",
@@ -193,7 +217,11 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 		_ = writeSocks5Reply(clientConn, classifyDialError(err))
 		return
 	}
-	defer upstreamConn.Close()
+	s.trackConn(upstreamConn, true)
+	defer func() {
+		s.trackConn(upstreamConn, false)
+		_ = upstreamConn.Close()
+	}()
 
 	if err := writeSocks5Reply(clientConn, repSucceeded); err != nil {
 		return
@@ -206,7 +234,6 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 		"remote", clientConn.RemoteAddr(),
 	)
 
-	// Clear handshake deadline and pipe bytes with idle timeout refresh.
 	_ = clientConn.SetDeadline(time.Time{})
 	_ = upstreamConn.SetDeadline(time.Time{})
 	pipeConnections(clientConn, upstreamConn, s.cfg.IdleTimeout())
@@ -220,54 +247,27 @@ func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int) (int, er
 	if header[0] != socks5Version {
 		return 0, fmt.Errorf("unsupported SOCKS version %d", header[0])
 	}
-	nMethods := int(header[1])
-	methods := make([]byte, nMethods)
+	methods := make([]byte, int(header[1]))
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return 0, err
 	}
 
-	hasNoAuth := false
-	hasUserPass := false
-	for _, m := range methods {
-		switch m {
-		case methodNoAuth:
-			hasNoAuth = true
-		case methodUserPass:
-			hasUserPass = true
+	if fixedTeam > 0 && slices.Contains(methods, methodNoAuth) {
+		if _, err := conn.Write([]byte{socks5Version, methodNoAuth}); err != nil {
+			return 0, err
 		}
+		return fixedTeam, nil
 	}
 
-	// Dedicated per-team port (base_socks_port + N): prefer NoAuth (0x00), fallback to UserPass (0x02).
-	if fixedTeam > 0 {
-		if hasNoAuth {
-			if _, err := conn.Write([]byte{socks5Version, methodNoAuth}); err != nil {
-				return 0, err
-			}
-			return fixedTeam, nil
+	if slices.Contains(methods, methodUserPass) {
+		if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
+			return 0, err
 		}
-		if hasUserPass {
-			if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
-				return 0, err
-			}
-			team, err := s.readUserPassAuth(conn, fixedTeam)
-			if err != nil {
-				return 0, err
-			}
-			return team, nil
-		}
-		_, _ = conn.Write([]byte{socks5Version, methodNoAcceptable})
-		return 0, errors.New("client offered no supported auth methods")
+		return s.readUserPassAuth(conn, fixedTeam)
 	}
 
-	// Multiplexed base port (base_socks_port): require Username/Password auth to identify the team.
-	if !hasUserPass {
-		_, _ = conn.Write([]byte{socks5Version, methodNoAcceptable})
-		return 0, errors.New("base port requires RFC 1929 username/password authentication")
-	}
-	if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
-		return 0, err
-	}
-	return s.readUserPassAuth(conn, 0)
+	_, _ = conn.Write([]byte{socks5Version, methodNoAcceptable})
+	return 0, errors.New("client offered no acceptable auth methods")
 }
 
 func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int) (int, error) {
@@ -288,8 +288,7 @@ func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int) (int,
 	if _, err := io.ReadFull(conn, pLenBuf); err != nil {
 		return 0, err
 	}
-	pLen := int(pLenBuf[0])
-	passwd := make([]byte, pLen)
+	passwd := make([]byte, int(pLenBuf[0]))
 	if _, err := io.ReadFull(conn, passwd); err != nil {
 		return 0, err
 	}
@@ -339,8 +338,7 @@ func (s *Socks5Server) readRequest(conn io.ReadWriter) (host string, port uint16
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
 			return "", 0, atyp, cmd, err
 		}
-		dLen := int(lenBuf[0])
-		domainBuf := make([]byte, dLen)
+		domainBuf := make([]byte, int(lenBuf[0]))
 		if _, err := io.ReadFull(conn, domainBuf); err != nil {
 			return "", 0, atyp, cmd, err
 		}
@@ -352,8 +350,7 @@ func (s *Socks5Server) readRequest(conn io.ReadWriter) (host string, port uint16
 		}
 		host = net.IP(ipBuf).String()
 	default:
-		_ = writeSocks5Reply(conn, repAddressTypeNotSupport)
-		return "", 0, atyp, cmd, fmt.Errorf("unsupported ATYP 0x%02x", atyp)
+		return "", 0, atyp, cmd, nil
 	}
 
 	portBuf := make([]byte, 2)
@@ -368,10 +365,10 @@ func writeSocks5Reply(w io.Writer, rep byte) error {
 	reply := []byte{
 		socks5Version,
 		rep,
-		0x00,     // RSV
-		atypIPv4, // BND.ADDR type = IPv4
+		0x00,
+		atypIPv4,
 		0, 0, 0, 0,
-		0, 0, // BND.PORT = 0
+		0, 0,
 	}
 	_, err := w.Write(reply)
 	return err
