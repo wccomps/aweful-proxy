@@ -7,7 +7,7 @@ Before dialing any outbound TCP connection for Team `N`, the system MUST verify 
 
 #### Scenario: Attempt to reach localhost or Kubernetes cluster network via proxy
 - **GIVEN** a client connected to Team 1's proxy (`1081`)
-- **WHEN** the client requests `CONNECT 127.0.0.1:8080`, `CONNECT 10.0.4.6:22`, or a hostname that resolves to `10.0.0.1`
+- **WHEN** the client requests `CONNECT 127.0.0.1:8080`, `CONNECT 192.0.2.6:22`, or a hostname that resolves to `10.0.0.1`
 - **THEN** the proxy rejects the request with SOCKS5 `REP = 0x02` (`Connection not allowed by ruleset`) and does not dial the target
 
 #### Scenario: Cross-team pivot attempt via literal IP or poisoned DNS

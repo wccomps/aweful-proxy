@@ -10,7 +10,7 @@ The configuration schema SHALL require:
 - `internal_mask` (string prefix with 3 octets and trailing dot, e.g., `"192.168.220."`)
 - `external_mask` (string prefix containing `"xx"` placeholder for the two-digit team number, e.g., `"10.100.1xx."`)
 - `team_dns_server_last_octet` (string or integer `1..254`, e.g., `"132"`)
-- `team_domain_name` (string, e.g., `"acme.com"`)
+- `team_domain_name` (string, e.g., `"example.com"`)
 
 The configuration schema SHALL accept optional fields with defaults:
 - `base_socks_port` (integer, default `1080`)
@@ -23,7 +23,7 @@ The configuration schema SHALL accept optional fields with defaults:
 - `static_hosts` (map of hostname string to last-octet integer `1..254`, default `{}`)
 
 #### Scenario: Valid configuration file loaded at startup
-- **GIVEN** a JSON configuration file with `number_of_teams: 20`, `internal_mask: "192.168.220."`, `external_mask: "10.100.1xx."`, `team_dns_server_last_octet: "132"`, and `team_domain_name: "acme.com"`
+- **GIVEN** a JSON configuration file with `number_of_teams: 20`, `internal_mask: "192.168.220."`, `external_mask: "10.100.1xx."`, `team_dns_server_last_octet: "132"`, and `team_domain_name: "example.com"`
 - **WHEN** `aweful-proxy` starts with `-config config.json`
 - **THEN** the configuration is parsed without error and team external prefixes are computed as `"10.100.101."` through `"10.100.120."`
 

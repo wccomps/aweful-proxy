@@ -32,6 +32,6 @@ On a team-scoped connection, the system SHALL accept RFC 1928 `CONNECT` (`CMD = 
 - **THEN** the proxy replies with `REP = 0x07` (`Command not supported`) and closes the connection
 
 #### Scenario: Transparent Layer-4 bidirectional piping
-- **GIVEN** a client connected to Team 6's SOCKS5 port (`1086`) requesting `CONNECT chat.acme.com:443`
-- **WHEN** `chat.acme.com` resolves and translates to `10.100.106.25` and the TCP connection to `10.100.106.25:443` succeeds
+- **GIVEN** a client connected to Team 6's SOCKS5 port (`1086`) requesting `CONNECT app.example.com:443`
+- **WHEN** `app.example.com` resolves and translates to `10.100.106.25` and the TCP connection to `10.100.106.25:443` succeeds
 - **THEN** the proxy replies with `REP = 0x00` (`Succeeded`) and copies raw bytes bidirectionally without inspecting or modifying TLS or HTTP payloads

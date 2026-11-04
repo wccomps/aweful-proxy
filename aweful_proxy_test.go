@@ -27,9 +27,9 @@ func TestLoadAndValidateConfig(t *testing.T) {
 		"internal_mask": "192.168.220.",
 		"external_mask": "10.100.1xx.",
 		"team_dns_server_last_octet": "132",
-		"team_domain_name": "acme.com",
+		"team_domain_name": "example.com",
 		"static_hosts": {
-			"chat.acme.com": 25
+			"app.example.com": 25
 		}
 	}`
 	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
@@ -60,7 +60,7 @@ func TestInvalidConfigsRejected(t *testing.T) {
 	base.InternalMask = "192.168.220."
 	base.ExternalMask = "10.100.1xx."
 	base.TeamDNSServerLastOctet = 132
-	base.TeamDomainName = "acme.com"
+	base.TeamDomainName = "example.com"
 
 	cases := []struct {
 		name   string
@@ -73,7 +73,7 @@ func TestInvalidConfigsRejected(t *testing.T) {
 		{"bad dns octet", func(c *Config) { c.TeamDNSServerLastOctet = 0 }},
 		{"empty domain", func(c *Config) { c.TeamDomainName = "" }},
 		{"bad static_hosts_mode", func(c *Config) { c.StaticHostsMode = "invalid" }},
-		{"bad static_hosts octet", func(c *Config) { c.StaticHosts = map[string]int{"chat.acme.com": 255} }},
+		{"bad static_hosts octet", func(c *Config) { c.StaticHosts = map[string]int{"app.example.com": 255} }},
 	}
 
 	for _, tc := range cases {
@@ -133,12 +133,12 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 		}
 		for _, q := range r.Question {
 			switch q.Name {
-			case "chat.acme.com.":
+			case "app.example.com.":
 				m.Answer = append(m.Answer, &dns.A{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 					A:   net.ParseIP("192.168.220.25"),
 				})
-			case "poison.acme.com.":
+			case "poison.example.com.":
 				m.Answer = append(m.Answer, &dns.A{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 					A:   net.ParseIP(badIP),
@@ -167,9 +167,9 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 	cfg.ExternalMask = "127.1xx.0."
 	cfg.TeamDNSServerLastOctet = 132
 	cfg.TeamDNSServerPort = dnsPort
-	cfg.TeamDomainName = "acme.com"
+	cfg.TeamDomainName = "example.com"
 	cfg.StaticHosts = map[string]int{
-		"mail.acme.com": 50,
+		"mail.example.com": 50,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate failed: %v", err)
@@ -178,9 +178,9 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 	resolver := NewResolver(cfg)
 	ctx := context.Background()
 
-	gotIP, err := resolver.Resolve(ctx, 6, "chat.acme.com")
+	gotIP, err := resolver.Resolve(ctx, 6, "app.example.com")
 	if err != nil {
-		t.Fatalf("Resolve chat.acme.com failed: %v", err)
+		t.Fatalf("Resolve app.example.com failed: %v", err)
 	}
 	if gotIP != "127.106.0.25" {
 		t.Fatalf("expected 127.106.0.25, got %s", gotIP)
@@ -189,34 +189,34 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 	dnsMu.Lock()
 	failDNS = true
 	dnsMu.Unlock()
-	gotCached, err := resolver.Resolve(ctx, 6, "chat.acme.com")
+	gotCached, err := resolver.Resolve(ctx, 6, "app.example.com")
 	if err != nil {
-		t.Fatalf("Resolve chat.acme.com from LKG cache failed: %v", err)
+		t.Fatalf("Resolve app.example.com from LKG cache failed: %v", err)
 	}
 	if gotCached != "127.106.0.25" {
 		t.Fatalf("expected cached 127.106.0.25, got %s", gotCached)
 	}
 
-	gotStatic, err := resolver.Resolve(ctx, 6, "mail.acme.com")
+	gotStatic, err := resolver.Resolve(ctx, 6, "mail.example.com")
 	if err != nil {
-		t.Fatalf("Resolve mail.acme.com from static_hosts failed: %v", err)
+		t.Fatalf("Resolve mail.example.com from static_hosts failed: %v", err)
 	}
 	if gotStatic != "127.106.0.50" {
 		t.Fatalf("expected static 127.106.0.50, got %s", gotStatic)
 	}
 
-	for _, bad := range []string{"127.101.0.25", "127.0.0.1", "10.0.4.6"} {
+	for _, bad := range []string{"127.101.0.25", "127.0.0.1", "192.0.2.6"} {
 		dnsMu.Lock()
 		failDNS = false
 		poisonedIP = bad
 		dnsMu.Unlock()
-		_, err := resolver.Resolve(ctx, 6, "poison.acme.com")
+		_, err := resolver.Resolve(ctx, 6, "poison.example.com")
 		if !errors.Is(err, ErrDestinationNotAllowed) {
 			t.Fatalf("expected ErrDestinationNotAllowed for poisoned IP %s, got %v", bad, err)
 		}
 	}
 
-	if _, err := resolver.Resolve(ctx, 0, "mail.acme.com"); !errors.Is(err, ErrDestinationNotAllowed) {
+	if _, err := resolver.Resolve(ctx, 0, "mail.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
 		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team 0, got %v", err)
 	}
 
@@ -261,11 +261,11 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 	cfg.InternalMask = "192.168.220."
 	cfg.ExternalMask = "127.1xx.0."
 	cfg.TeamDNSServerLastOctet = 132
-	cfg.TeamDomainName = "acme.com"
+	cfg.TeamDomainName = "example.com"
 	cfg.SocksListenHost = "127.0.0.1"
 	cfg.StaticHostsMode = "override"
 	cfg.StaticHosts = map[string]int{
-		"chat.acme.com": 25,
+		"app.example.com": 25,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -316,7 +316,7 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 			t.Fatalf("unexpected auth response: %v", authResp)
 		}
 
-		host := "chat.acme.com"
+		host := "app.example.com"
 		req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
 		req = append(req, []byte(host)...)
 		portBytes := make([]byte, 2)
@@ -397,7 +397,7 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 			t.Fatalf("expected RFC 1929 auth success 0x00, got 0x%02x", subResp[1])
 		}
 
-		host := "chat.acme.com"
+		host := "app.example.com"
 		req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
 		req = append(req, []byte(host)...)
 		portBytes := make([]byte, 2)
@@ -425,7 +425,7 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		authResp := make([]byte, 2)
 		_, _ = io.ReadFull(conn, authResp)
 
-		req := []byte{0x05, 0x01, 0x00, 0x01, 10, 0, 4, 6, 0x00, 0x50}
+		req := []byte{0x05, 0x01, 0x00, 0x01, 192, 0, 2, 6, 0x00, 0x50}
 		_, _ = conn.Write(req)
 
 		rep := make([]byte, 10)
@@ -467,7 +467,7 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 	cfg.InternalMask = "192.168.220."
 	cfg.ExternalMask = "10.100.1xx."
 	cfg.TeamDNSServerLastOctet = 132
-	cfg.TeamDomainName = "acme.com"
+	cfg.TeamDomainName = "example.com"
 	cfg.BaseSocksPort = 1080
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -475,7 +475,7 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 
 	handler := NewHTTPHandler(cfg)
 
-	reqHealth := httptest.NewRequest(http.MethodGet, "http://10.0.4.15:8080/healthz", nil)
+	reqHealth := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:8080/healthz", nil)
 	recHealth := httptest.NewRecorder()
 	handler.ServeHTTP(recHealth, reqHealth)
 	if recHealth.Code != http.StatusOK {
@@ -489,7 +489,7 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 		t.Fatalf("unexpected healthz body: %v", health)
 	}
 
-	reqFoxy := httptest.NewRequest(http.MethodGet, "http://10.0.4.15:8080/foxyproxy.json", nil)
+	reqFoxy := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:8080/foxyproxy.json", nil)
 	recFoxy := httptest.NewRecorder()
 	handler.ServeHTTP(recFoxy, reqFoxy)
 	if recFoxy.Code != http.StatusOK {
@@ -503,7 +503,7 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 		t.Fatalf("expected 20 FoxyProxy entries, got %d", len(export.Data))
 	}
 	first := export.Data[0]
-	if first.Title != "Team 01" || first.Type != "socks5" || first.Hostname != "10.0.4.15" || first.Port != "1081" || !first.ProxyDNS {
+	if first.Title != "Team 01" || first.Type != "socks5" || first.Hostname != "192.0.2.10" || first.Port != "1081" || !first.ProxyDNS {
 		t.Fatalf("unexpected Team 01 entry: %+v", first)
 	}
 	last := export.Data[19]
