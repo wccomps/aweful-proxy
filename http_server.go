@@ -161,6 +161,14 @@ func BuildFoxyProxyConfig(cfg Config, proxyHost string, includeTeamZero bool) Fo
 				Active:  true,
 			})
 		}
+		if cfg.InternalMask != "" {
+			includes = append(includes, FoxyProxyPattern{
+				Type:    "wildcard",
+				Title:   "internal-subnet",
+				Pattern: cfg.InternalMask + "*",
+				Active:  true,
+			})
+		}
 
 		entries = append(entries, FoxyProxyEntry{
 			Active:   true,
@@ -179,10 +187,31 @@ func BuildFoxyProxyConfig(cfg Config, proxyHost string, includeTeamZero bool) Fo
 		Mode:        "disable",
 		Sync:        false,
 		AutoBackup:  false,
-		Passthrough: "",
+		Passthrough: buildFoxyProxyPassthrough(cfg),
 		Theme:       "",
 		Container:   map[string]interface{}{},
 		Commands:    map[string]interface{}{},
 		Data:        entries,
 	}
+}
+
+// buildFoxyProxyPassthrough constructs a FoxyProxy v8 global passthrough rule that bypasses
+// the proxy (sending traffic DIRECT) for any URL whose host does not match the team domain,
+// internal subnet mask, or external subnet prefix. This allows users to select a specific
+// "Team XX" proxy in the FoxyProxy toolbar without breaking general internet browsing.
+func buildFoxyProxyPassthrough(cfg Config) string {
+	var allowed []string
+	if cfg.TeamDomainName != "" && cfg.TeamDomainName != "auto" {
+		allowed = append(allowed, "[^/]+."+cfg.TeamDomainName, cfg.TeamDomainName)
+	}
+	if cfg.InternalMask != "" {
+		allowed = append(allowed, cfg.InternalMask)
+	}
+	if extPrefix, _, ok := strings.Cut(cfg.ExternalMask, "xx."); ok && extPrefix != "" {
+		allowed = append(allowed, extPrefix)
+	}
+	if len(allowed) == 0 {
+		return ""
+	}
+	return "(?!" + strings.Join(allowed, "|") + ")*"
 }

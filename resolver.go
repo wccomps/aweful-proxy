@@ -9,11 +9,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/miekg/dns"
 )
 
-const maxLKGCacheEntries = 2048
+const (
+	maxLKGCacheEntries   = 2048
+	dnsUnhealthyCooldown = 15 * time.Second
+)
 
 var (
 	ErrDestinationNotAllowed = errors.New("destination IP is outside team external subnet")
@@ -26,17 +30,19 @@ type cacheKey struct {
 }
 
 type Resolver struct {
-	mu       sync.RWMutex
-	cfg      Config
-	cacheMu  sync.RWMutex
-	lkgCache map[cacheKey]string
+	mu             sync.RWMutex
+	cfg            Config
+	cacheMu        sync.RWMutex
+	lkgCache       map[cacheKey]string
+	unhealthyDNS   map[int]time.Time
 }
 
 func NewResolver(cfg Config) *Resolver {
 	cfg.normalize()
 	return &Resolver{
-		cfg:      cfg,
-		lkgCache: make(map[cacheKey]string),
+		cfg:          cfg,
+		lkgCache:     make(map[cacheKey]string),
+		unhealthyDNS: make(map[int]time.Time),
 	}
 }
 
@@ -118,18 +124,42 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 		}
 	}
 
+	if cfg.TeamDomainName != "" && cfg.TeamDomainName != "auto" {
+		if !isHostInTeamDomain(normalized, cfg.TeamDomainName) {
+			if _, ok := r.lookupStaticHost(cfg, team, normalized); !ok {
+				return "", ErrDestinationNotAllowed
+			}
+		}
+	}
+
 	var (
 		ips    []net.IP
 		dnsErr error
 	)
 	if int(cfg.TeamDNSServerLastOctet) >= 1 {
-		serverAddr := cfg.TeamDNSServerAddr(team)
-		ips, dnsErr = r.queryDNS(ctx, serverAddr, normalized, cfg)
+		skipPrimary := false
+		if team > 0 {
+			r.cacheMu.RLock()
+			until, exists := r.unhealthyDNS[team]
+			r.cacheMu.RUnlock()
+			if exists && time.Now().Before(until) {
+				skipPrimary = true
+			}
+		}
+		if !skipPrimary {
+			serverAddr := cfg.TeamDNSServerAddr(team)
+			ips, dnsErr = r.queryDNS(ctx, serverAddr, normalized, cfg)
+		}
 		// If Team N's DNS server is unreachable/refused and Team 0 (golden master pod) exists,
 		// fall back to querying Team 0's DNS server since all team zones are cloned identically.
-		if (dnsErr != nil || len(ips) == 0) && team > 0 {
+		if (skipPrimary || dnsErr != nil || len(ips) == 0) && team > 0 {
 			masterAddr := cfg.TeamDNSServerAddr(0)
 			if masterIPs, masterErr := r.queryDNS(ctx, masterAddr, normalized, cfg); masterErr == nil && len(masterIPs) > 0 {
+				if !skipPrimary && dnsErr != nil {
+					r.cacheMu.Lock()
+					r.unhealthyDNS[team] = time.Now().Add(dnsUnhealthyCooldown)
+					r.cacheMu.Unlock()
+				}
 				ips = masterIPs
 				dnsErr = nil
 			}
@@ -240,4 +270,12 @@ func (r *Resolver) lookupStaticHost(cfg Config, team int, normalizedHost string)
 		return "", false
 	}
 	return fmt.Sprintf("%s%d", cfg.TeamExternalPrefix(team), octet), true
+}
+
+func isHostInTeamDomain(normalizedHost, teamDomain string) bool {
+	domain := strings.ToLower(strings.Trim(teamDomain, "."))
+	if domain == "" {
+		return true
+	}
+	return normalizedHost == domain || strings.HasSuffix(normalizedHost, "."+domain)
 }

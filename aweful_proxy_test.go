@@ -501,6 +501,10 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 	if len(export.Data) != 20 {
 		t.Fatalf("expected 20 FoxyProxy entries, got %d", len(export.Data))
 	}
+	wantPassthrough := "(?![^/]+.example.com|example.com|192.168.220.|10.100.1)*"
+	if export.Passthrough != wantPassthrough {
+		t.Fatalf("expected Passthrough %q, got %q", wantPassthrough, export.Passthrough)
+	}
 	first := export.Data[0]
 	if first.Title != "Team 01" || first.Type != "socks5" || first.Hostname != "192.0.2.10" || first.Port != "1081" || !first.ProxyDNS {
 		t.Fatalf("unexpected Team 01 entry: %+v", first)
