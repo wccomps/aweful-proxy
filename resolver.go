@@ -117,27 +117,21 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 	if dnsErr != nil {
 		return "", fmt.Errorf("%w: %v", ErrHostNotFound, dnsErr)
 	}
+	if len(ips) == 0 {
+		return "", ErrHostNotFound
+	}
 
-	var sawDisallowed bool
 	for _, ip := range ips {
-		translated, err := r.TranslateAndValidateIPv4(team, ip.String())
-		if err == nil {
+		if translated, err := r.TranslateAndValidateIPv4(team, ip.String()); err == nil {
 			return translated, nil
 		}
-		if errors.Is(err, ErrDestinationNotAllowed) {
-			sawDisallowed = true
-		}
 	}
-	if sawDisallowed {
-		slog.Warn("DNS returned IP outside team subnet",
-			"team", team,
-			"host", normalized,
-			"ips", ips,
-		)
-		return "", ErrDestinationNotAllowed
-	}
-
-	return "", ErrHostNotFound
+	slog.Warn("DNS returned IP outside team subnet",
+		"team", team,
+		"host", normalized,
+		"ips", ips,
+	)
+	return "", ErrDestinationNotAllowed
 }
 
 func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, error) {
