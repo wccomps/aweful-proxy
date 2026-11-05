@@ -24,7 +24,12 @@ func (fo *FlexibleOctet) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &strVal); err != nil {
 		return fmt.Errorf("octet must be a string or integer: %w", err)
 	}
-	parsed, err := strconv.Atoi(strings.TrimSpace(strVal))
+	trimmed := strings.ToLower(strings.TrimSpace(strVal))
+	if trimmed == "" || trimmed == "auto" || trimmed == "0" {
+		*fo = 0
+		return nil
+	}
+	parsed, err := strconv.Atoi(trimmed)
 	if err != nil {
 		return fmt.Errorf("invalid octet %q: %w", strVal, err)
 	}
@@ -138,6 +143,12 @@ func (c *Config) normalize() {
 	if c.StaticHostsMode == "" {
 		c.StaticHostsMode = "fallback"
 	}
+	if c.ExternalMask == "" {
+		c.ExternalMask = "10.100.1xx."
+	}
+	if c.InternalMask == "" {
+		c.InternalMask = "192.168.220."
+	}
 	if c.TeamDNSServerPort == 0 {
 		c.TeamDNSServerPort = 53
 	}
@@ -162,21 +173,18 @@ func (c *Config) Validate() error {
 	if !strings.Contains(c.ExternalMask, "xx") || !strings.HasSuffix(c.ExternalMask, ".") {
 		return fmt.Errorf("external_mask must contain \"xx\" and end with a dot, e.g. \"10.100.1xx.\" (got %q)", c.ExternalMask)
 	}
-	for team := 1; team <= c.NumberOfTeams; team++ {
+	for team := 0; team <= c.NumberOfTeams; team++ {
 		prefix := c.TeamExternalPrefix(team)
 		if !isValidThreeOctetPrefix(prefix) {
 			return fmt.Errorf("external_mask %q produced invalid IPv4 prefix %q for team %d", c.ExternalMask, prefix, team)
 		}
 	}
 	dnsOctet := int(c.TeamDNSServerLastOctet)
-	if dnsOctet < 1 || dnsOctet > 254 {
-		return fmt.Errorf("team_dns_server_last_octet must be between 1 and 254 (got %d)", dnsOctet)
+	if dnsOctet < 0 || dnsOctet > 254 {
+		return fmt.Errorf("team_dns_server_last_octet must be between 0 (auto) and 254 (got %d)", dnsOctet)
 	}
 	if c.TeamDNSServerPort < 1 || c.TeamDNSServerPort > 65535 {
 		return fmt.Errorf("team_dns_server_port must be between 1 and 65535 (got %d)", c.TeamDNSServerPort)
-	}
-	if c.TeamDomainName == "" {
-		return errors.New("team_domain_name is required")
 	}
 	if c.BaseSocksPort < 1 || c.BaseSocksPort+c.NumberOfTeams > 65535 {
 		return fmt.Errorf("base_socks_port (%d) + number_of_teams (%d) must be within valid TCP port range 1..65535", c.BaseSocksPort, c.NumberOfTeams)

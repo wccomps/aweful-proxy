@@ -33,6 +33,32 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if int(cfg.TeamDNSServerLastOctet) == 0 || cfg.TeamDomainName == "" || cfg.TeamDomainName == "auto" {
+		slog.Info("Auto-discovering team DNS server and domain name",
+			"external_mask", cfg.ExternalMask,
+			"internal_mask", cfg.InternalMask,
+		)
+		discCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		res, discErr := DiscoverEnvironment(discCtx, cfg)
+		cancel()
+		if discErr != nil {
+			slog.Warn("Initial DNS auto-discovery did not succeed (can retry via POST /discover)", "err", discErr)
+		} else {
+			if int(cfg.TeamDNSServerLastOctet) == 0 {
+				cfg.TeamDNSServerLastOctet = FlexibleOctet(res.DNSServerLastOctet)
+			}
+			if cfg.TeamDomainName == "" || cfg.TeamDomainName == "auto" {
+				cfg.TeamDomainName = res.TeamDomainName
+			}
+			slog.Info("Auto-discovered team DNS configuration",
+				"dns_server_last_octet", int(cfg.TeamDNSServerLastOctet),
+				"team_domain_name", cfg.TeamDomainName,
+				"sample_host", res.SampleHost,
+				"from_ip", res.DiscoveredFromIP,
+			)
+		}
+	}
+
 	resolver := NewResolver(cfg)
 	socksServer := NewSocks5Server(cfg, resolver)
 	if err := socksServer.Start(ctx); err != nil {
@@ -45,14 +71,15 @@ func main() {
 		"team_ports_end", cfg.BaseSocksPort+cfg.NumberOfTeams,
 		"teams", cfg.NumberOfTeams,
 		"domain", cfg.TeamDomainName,
+		"dns_octet", int(cfg.TeamDNSServerLastOctet),
 	)
 
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPListenAddr,
-		Handler:           NewHTTPHandler(cfg),
+		Handler:           NewHTTPHandler(resolver),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 

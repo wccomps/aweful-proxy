@@ -26,6 +26,7 @@ type cacheKey struct {
 }
 
 type Resolver struct {
+	mu       sync.RWMutex
 	cfg      Config
 	cacheMu  sync.RWMutex
 	lkgCache map[cacheKey]string
@@ -39,20 +40,37 @@ func NewResolver(cfg Config) *Resolver {
 	}
 }
 
-func (r *Resolver) queryDNS(ctx context.Context, serverAddr string, fqdn string) ([]net.IP, error) {
+func (r *Resolver) ConfigSnapshot() Config {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg
+}
+
+func (r *Resolver) UpdateDiscovery(dnsOctet int, domain string) {
+	r.mu.Lock()
+	if dnsOctet >= 1 && dnsOctet <= 254 {
+		r.cfg.TeamDNSServerLastOctet = FlexibleOctet(dnsOctet)
+	}
+	if domain != "" && domain != "auto" {
+		r.cfg.TeamDomainName = strings.ToLower(strings.Trim(domain, "."))
+	}
+	r.mu.Unlock()
+}
+
+func (r *Resolver) queryDNS(ctx context.Context, serverAddr string, fqdn string, timeoutCfg Config) ([]net.IP, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
 	msg.RecursionDesired = true
 
 	client := &dns.Client{
 		Net:     "udp",
-		Timeout: r.cfg.DNSTimeout(),
+		Timeout: timeoutCfg.DNSTimeout(),
 	}
 	resp, _, err := client.ExchangeContext(ctx, msg, serverAddr)
 	if err == nil && resp != nil && resp.Truncated {
 		tcpClient := &dns.Client{
 			Net:     "tcp",
-			Timeout: r.cfg.DNSTimeout(),
+			Timeout: timeoutCfg.DNSTimeout(),
 		}
 		resp, _, err = tcpClient.ExchangeContext(ctx, msg, serverAddr)
 	}
@@ -78,7 +96,8 @@ func (r *Resolver) queryDNS(ctx context.Context, serverAddr string, fqdn string)
 }
 
 func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, error) {
-	if team < 1 || team > r.cfg.NumberOfTeams {
+	cfg := r.ConfigSnapshot()
+	if team < 0 || team > cfg.NumberOfTeams {
 		return "", ErrDestinationNotAllowed
 	}
 	normalized := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
@@ -93,14 +112,32 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 		return r.TranslateAndValidateIPv4(team, ip.To4().String())
 	}
 
-	if r.cfg.StaticHostsMode == "override" {
-		if ip, ok := r.lookupStaticHost(team, normalized); ok {
+	if cfg.StaticHostsMode == "override" {
+		if ip, ok := r.lookupStaticHost(cfg, team, normalized); ok {
 			return ip, nil
 		}
 	}
 
-	serverAddr := r.cfg.TeamDNSServerAddr(team)
-	ips, dnsErr := r.queryDNS(ctx, serverAddr, normalized)
+	var (
+		ips    []net.IP
+		dnsErr error
+	)
+	if int(cfg.TeamDNSServerLastOctet) >= 1 {
+		serverAddr := cfg.TeamDNSServerAddr(team)
+		ips, dnsErr = r.queryDNS(ctx, serverAddr, normalized, cfg)
+		// If Team N's DNS server is unreachable/refused and Team 0 (golden master pod) exists,
+		// fall back to querying Team 0's DNS server since all team zones are cloned identically.
+		if (dnsErr != nil || len(ips) == 0) && team > 0 {
+			masterAddr := cfg.TeamDNSServerAddr(0)
+			if masterIPs, masterErr := r.queryDNS(ctx, masterAddr, normalized, cfg); masterErr == nil && len(masterIPs) > 0 {
+				ips = masterIPs
+				dnsErr = nil
+			}
+		}
+	} else {
+		dnsErr = errors.New("DNS server octet not yet discovered")
+	}
+
 	if dnsErr == nil && len(ips) > 0 {
 		var sawDisallowed bool
 		for _, ip := range ips {
@@ -122,15 +159,14 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 			slog.Warn("DNS returned IP outside team subnet",
 				"team", team,
 				"host", normalized,
-				"dns_server", serverAddr,
 				"ips", ips,
 			)
 			return "", ErrDestinationNotAllowed
 		}
 	}
 
-	if r.cfg.StaticHostsMode == "fallback" {
-		if ip, ok := r.lookupStaticHost(team, normalized); ok {
+	if cfg.StaticHostsMode == "fallback" {
+		if ip, ok := r.lookupStaticHost(cfg, team, normalized); ok {
 			slog.Info("Using static_hosts fallback for host",
 				"team", team,
 				"host", normalized,
@@ -161,7 +197,8 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 }
 
 func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, error) {
-	if team < 1 || team > r.cfg.NumberOfTeams {
+	cfg := r.ConfigSnapshot()
+	if team < 0 || team > cfg.NumberOfTeams {
 		return "", ErrDestinationNotAllowed
 	}
 	parsed := net.ParseIP(strings.TrimSpace(rawIP))
@@ -170,9 +207,9 @@ func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, err
 	}
 	ipStr := parsed.To4().String()
 
-	teamPrefix := r.cfg.TeamExternalPrefix(team)
-	if strings.HasPrefix(ipStr, r.cfg.InternalMask) {
-		lastOctet := strings.TrimPrefix(ipStr, r.cfg.InternalMask)
+	teamPrefix := cfg.TeamExternalPrefix(team)
+	if strings.HasPrefix(ipStr, cfg.InternalMask) {
+		lastOctet := strings.TrimPrefix(ipStr, cfg.InternalMask)
 		ipStr = teamPrefix + lastOctet
 	}
 
@@ -187,20 +224,20 @@ func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, err
 	return ipStr, nil
 }
 
-func (r *Resolver) lookupStaticHost(team int, normalizedHost string) (string, bool) {
-	if len(r.cfg.StaticHosts) == 0 {
+func (r *Resolver) lookupStaticHost(cfg Config, team int, normalizedHost string) (string, bool) {
+	if len(cfg.StaticHosts) == 0 {
 		return "", false
 	}
-	octet, ok := r.cfg.StaticHosts[normalizedHost]
-	if !ok && r.cfg.TeamDomainName != "" {
-		suffix := "." + r.cfg.TeamDomainName
+	octet, ok := cfg.StaticHosts[normalizedHost]
+	if !ok && cfg.TeamDomainName != "" {
+		suffix := "." + cfg.TeamDomainName
 		if strings.HasSuffix(normalizedHost, suffix) {
 			short := strings.TrimSuffix(normalizedHost, suffix)
-			octet, ok = r.cfg.StaticHosts[short]
+			octet, ok = cfg.StaticHosts[short]
 		}
 	}
 	if !ok || octet < 1 || octet > 254 {
 		return "", false
 	}
-	return fmt.Sprintf("%s%d", r.cfg.TeamExternalPrefix(team), octet), true
+	return fmt.Sprintf("%s%d", cfg.TeamExternalPrefix(team), octet), true
 }

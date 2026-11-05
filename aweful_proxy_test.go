@@ -70,8 +70,7 @@ func TestInvalidConfigsRejected(t *testing.T) {
 		{"too many teams", func(c *Config) { c.NumberOfTeams = 100 }},
 		{"missing xx in external_mask", func(c *Config) { c.ExternalMask = "10.100.100." }},
 		{"bad internal_mask", func(c *Config) { c.InternalMask = "192.168.220" }},
-		{"bad dns octet", func(c *Config) { c.TeamDNSServerLastOctet = 0 }},
-		{"empty domain", func(c *Config) { c.TeamDomainName = "" }},
+		{"bad dns octet", func(c *Config) { c.TeamDNSServerLastOctet = -1 }},
 		{"bad static_hosts_mode", func(c *Config) { c.StaticHostsMode = "invalid" }},
 		{"bad static_hosts octet", func(c *Config) { c.StaticHosts = map[string]int{"app.example.com": 255} }},
 	}
@@ -104,7 +103,7 @@ func TestParseTeamUsername(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"", "team", "team0", "team21", "-1", "_1", "team-_1", "+1", "admin"}
+	invalid := []string{"", "team", "team21", "-1", "_1", "team-_1", "+1", "admin"}
 	for _, input := range invalid {
 		if got, err := ParseTeamUsername(input, 20); err == nil {
 			t.Fatalf("ParseTeamUsername(%q) = %d, expected error", input, got)
@@ -216,8 +215,8 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 		}
 	}
 
-	if _, err := resolver.Resolve(ctx, 0, "mail.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
-		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team 0, got %v", err)
+	if _, err := resolver.Resolve(ctx, -1, "mail.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
+		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team -1, got %v", err)
 	}
 
 	translatedLiteral, err := resolver.TranslateAndValidateIPv4(6, "192.168.220.42")
@@ -473,7 +472,7 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := NewHTTPHandler(cfg)
+	handler := NewHTTPHandler(NewResolver(cfg))
 
 	reqHealth := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:8080/healthz", nil)
 	recHealth := httptest.NewRecorder()

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 var teamBadgeColors = []string{
@@ -51,23 +53,45 @@ type FoxyProxyPattern struct {
 	Active  bool   `json:"active"`
 }
 
-func NewHTTPHandler(cfg Config) http.Handler {
+func NewHTTPHandler(resolver *Resolver) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		cfg := resolver.ConfigSnapshot()
 		w.Header().Set("Content-Type", "application/json")
 		resp := map[string]interface{}{
-			"status":          "ok",
-			"teams":           cfg.NumberOfTeams,
-			"domain":          cfg.TeamDomainName,
-			"base_socks_port": cfg.BaseSocksPort,
+			"status":                     "ok",
+			"teams":                      cfg.NumberOfTeams,
+			"domain":                     cfg.TeamDomainName,
+			"team_dns_server_last_octet": int(cfg.TeamDNSServerLastOctet),
+			"base_socks_port":            cfg.BaseSocksPort,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
+	mux.HandleFunc("POST /discover", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		cfg := resolver.ConfigSnapshot()
+		res, err := DiscoverEnvironment(ctx, cfg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  err.Error(),
+			})
+			return
+		}
+		resolver.UpdateDiscovery(res.DNSServerLastOctet, res.TeamDomainName)
+		_ = json.NewEncoder(w).Encode(res)
+	})
+
 	mux.HandleFunc("GET /foxyproxy.json", func(w http.ResponseWriter, r *http.Request) {
+		cfg := resolver.ConfigSnapshot()
 		proxyHost := resolveAdvertiseHost(cfg, r)
-		export := BuildFoxyProxyConfig(cfg, proxyHost)
+		includeTeamZero := r.URL.Query().Get("include_team0") == "1" || r.URL.Query().Get("include_team0") == "true"
+		export := BuildFoxyProxyConfig(cfg, proxyHost, includeTeamZero)
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="foxyproxy-teams.json"`)
@@ -115,14 +139,21 @@ func isValidHostOrIP(s string) bool {
 	return s[0] != '.' && s[0] != '-' && s[len(s)-1] != '-'
 }
 
-func BuildFoxyProxyConfig(cfg Config, proxyHost string) FoxyProxyExport {
-	entries := make([]FoxyProxyEntry, 0, cfg.NumberOfTeams)
-	for team := 1; team <= cfg.NumberOfTeams; team++ {
+func BuildFoxyProxyConfig(cfg Config, proxyHost string, includeTeamZero bool) FoxyProxyExport {
+	entries := make([]FoxyProxyEntry, 0, cfg.NumberOfTeams+1)
+	startTeam := 1
+	if includeTeamZero {
+		startTeam = 0
+	}
+	for team := startTeam; team <= cfg.NumberOfTeams; team++ {
 		port := cfg.BaseSocksPort + team
-		color := teamBadgeColors[(team-1)%len(teamBadgeColors)]
+		color := "#607d8b"
+		if team > 0 {
+			color = teamBadgeColors[(team-1)%len(teamBadgeColors)]
+		}
 
 		var includes []FoxyProxyPattern
-		if cfg.TeamDomainName != "" {
+		if cfg.TeamDomainName != "" && cfg.TeamDomainName != "auto" {
 			includes = append(includes, FoxyProxyPattern{
 				Type:    "wildcard",
 				Title:   cfg.TeamDomainName,
