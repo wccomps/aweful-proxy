@@ -27,10 +27,7 @@ func TestLoadAndValidateConfig(t *testing.T) {
 		"internal_mask": "192.168.220.",
 		"external_mask": "10.100.1xx.",
 		"team_dns_server_last_octet": "132",
-		"team_domain_name": "example.com",
-		"static_hosts": {
-			"app.example.com": 25
-		}
+		"team_domain_name": "example.com"
 	}`
 	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("writing config: %v", err)
@@ -71,8 +68,6 @@ func TestInvalidConfigsRejected(t *testing.T) {
 		{"missing xx in external_mask", func(c *Config) { c.ExternalMask = "10.100.100." }},
 		{"bad internal_mask", func(c *Config) { c.InternalMask = "192.168.220" }},
 		{"bad dns octet", func(c *Config) { c.TeamDNSServerLastOctet = -1 }},
-		{"bad static_hosts_mode", func(c *Config) { c.StaticHostsMode = "invalid" }},
-		{"bad static_hosts octet", func(c *Config) { c.StaticHosts = map[string]int{"app.example.com": 255} }},
 	}
 
 	for _, tc := range cases {
@@ -103,7 +98,7 @@ func TestParseTeamUsername(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"", "team", "team21", "-1", "_1", "team-_1", "+1", "admin"}
+	invalid := []string{"", "team", "team0", "0", "team21", "-1", "_1", "team-_1", "+1", "admin"}
 	for _, input := range invalid {
 		if got, err := ParseTeamUsername(input, 20); err == nil {
 			t.Fatalf("ParseTeamUsername(%q) = %d, expected error", input, got)
@@ -111,11 +106,12 @@ func TestParseTeamUsername(t *testing.T) {
 	}
 }
 
-func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
+func TestResolverPerTeamDNSAndSecurity(t *testing.T) {
 	var (
-		dnsMu      sync.Mutex
-		failDNS    bool
-		poisonedIP string
+		dnsMu            sync.Mutex
+		failDNS          bool
+		poisonedIP       string
+		crossTeamQueries int
 	)
 	dnsHandler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		dnsMu.Lock()
@@ -160,6 +156,36 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 		_ = dnsSrv.Shutdown()
 	})
 
+	for _, crossIP := range []string{"127.100.0.132", "127.101.0.132"} {
+		crossPC, err := net.ListenPacket("udp", fmt.Sprintf("%s:%d", crossIP, dnsPort))
+		if err != nil {
+			continue
+		}
+		crossSrv := &dns.Server{
+			PacketConn: crossPC,
+			Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+				dnsMu.Lock()
+				crossTeamQueries++
+				dnsMu.Unlock()
+				m := new(dns.Msg)
+				m.SetReply(r)
+				for _, q := range r.Question {
+					m.Answer = append(m.Answer, &dns.A{
+						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+						A:   net.ParseIP("192.168.220.25"),
+					})
+				}
+				_ = w.WriteMsg(m)
+			}),
+		}
+		go func() {
+			_ = crossSrv.ActivateAndServe()
+		}()
+		t.Cleanup(func() {
+			_ = crossSrv.Shutdown()
+		})
+	}
+
 	cfg := DefaultConfig()
 	cfg.NumberOfTeams = 6
 	cfg.InternalMask = "192.168.220."
@@ -167,9 +193,6 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 	cfg.TeamDNSServerLastOctet = 132
 	cfg.TeamDNSServerPort = dnsPort
 	cfg.TeamDomainName = "example.com"
-	cfg.StaticHosts = map[string]int{
-		"mail.example.com": 50,
-	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate failed: %v", err)
 	}
@@ -188,20 +211,14 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 	dnsMu.Lock()
 	failDNS = true
 	dnsMu.Unlock()
-	gotCached, err := resolver.Resolve(ctx, 6, "app.example.com")
-	if err != nil {
-		t.Fatalf("Resolve app.example.com from LKG cache failed: %v", err)
+	if _, err := resolver.Resolve(ctx, 6, "app.example.com"); !errors.Is(err, ErrHostNotFound) {
+		t.Fatalf("expected ErrHostNotFound when team DNS fails (no fallback), got %v", err)
 	}
-	if gotCached != "127.106.0.25" {
-		t.Fatalf("expected cached 127.106.0.25, got %s", gotCached)
-	}
-
-	gotStatic, err := resolver.Resolve(ctx, 6, "mail.example.com")
-	if err != nil {
-		t.Fatalf("Resolve mail.example.com from static_hosts failed: %v", err)
-	}
-	if gotStatic != "127.106.0.50" {
-		t.Fatalf("expected static 127.106.0.50, got %s", gotStatic)
+	dnsMu.Lock()
+	gotCrossQueries := crossTeamQueries
+	dnsMu.Unlock()
+	if gotCrossQueries != 0 {
+		t.Fatalf("expected 0 cross-team DNS queries when team 6 DNS fails, got %d", gotCrossQueries)
 	}
 
 	for _, bad := range []string{"127.101.0.25", "127.0.0.1", "192.0.2.6"} {
@@ -215,7 +232,10 @@ func TestResolverDNSAndFallbackAndSecurity(t *testing.T) {
 		}
 	}
 
-	if _, err := resolver.Resolve(ctx, -1, "mail.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
+	if _, err := resolver.Resolve(ctx, 0, "app.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
+		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team 0, got %v", err)
+	}
+	if _, err := resolver.Resolve(ctx, -1, "app.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
 		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team -1, got %v", err)
 	}
 
@@ -255,17 +275,42 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 		}
 	}()
 
+	team1DNSPc, err := net.ListenPacket("udp", "127.101.0.132:0")
+	if err != nil {
+		t.Fatalf("failed to bind Team 1 UDP DNS listener: %v", err)
+	}
+	team1DNSPort := team1DNSPc.LocalAddr().(*net.UDPAddr).Port
+	team1DNSSrv := &dns.Server{
+		PacketConn: team1DNSPc,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			m := new(dns.Msg)
+			m.SetReply(r)
+			for _, q := range r.Question {
+				if q.Name == "app.example.com." {
+					m.Answer = append(m.Answer, &dns.A{
+						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+						A:   net.ParseIP("192.168.220.25"),
+					})
+				}
+			}
+			_ = w.WriteMsg(m)
+		}),
+	}
+	go func() {
+		_ = team1DNSSrv.ActivateAndServe()
+	}()
+	t.Cleanup(func() {
+		_ = team1DNSSrv.Shutdown()
+	})
+
 	cfg := DefaultConfig()
 	cfg.NumberOfTeams = 2
 	cfg.InternalMask = "192.168.220."
 	cfg.ExternalMask = "127.1xx.0."
 	cfg.TeamDNSServerLastOctet = 132
+	cfg.TeamDNSServerPort = team1DNSPort
 	cfg.TeamDomainName = "example.com"
 	cfg.SocksListenHost = "127.0.0.1"
-	cfg.StaticHostsMode = "override"
-	cfg.StaticHosts = map[string]int{
-		"app.example.com": 25,
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

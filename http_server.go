@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -89,9 +90,13 @@ func NewHTTPHandler(resolver *Resolver) http.Handler {
 
 	mux.HandleFunc("GET /foxyproxy.json", func(w http.ResponseWriter, r *http.Request) {
 		cfg := resolver.ConfigSnapshot()
+		if qTeams := strings.TrimSpace(r.URL.Query().Get("teams")); qTeams != "" {
+			if n, err := strconv.Atoi(qTeams); err == nil && n >= 1 && n <= cfg.NumberOfTeams {
+				cfg.NumberOfTeams = n
+			}
+		}
 		proxyHost := resolveAdvertiseHost(cfg, r)
-		includeTeamZero := r.URL.Query().Get("include_team0") == "1" || r.URL.Query().Get("include_team0") == "true"
-		export := BuildFoxyProxyConfig(cfg, proxyHost, includeTeamZero)
+		export := BuildFoxyProxyConfig(cfg, proxyHost)
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="foxyproxy-teams.json"`)
@@ -139,18 +144,11 @@ func isValidHostOrIP(s string) bool {
 	return s[0] != '.' && s[0] != '-' && s[len(s)-1] != '-'
 }
 
-func BuildFoxyProxyConfig(cfg Config, proxyHost string, includeTeamZero bool) FoxyProxyExport {
-	entries := make([]FoxyProxyEntry, 0, cfg.NumberOfTeams+1)
-	startTeam := 1
-	if includeTeamZero {
-		startTeam = 0
-	}
-	for team := startTeam; team <= cfg.NumberOfTeams; team++ {
+func BuildFoxyProxyConfig(cfg Config, proxyHost string) FoxyProxyExport {
+	entries := make([]FoxyProxyEntry, 0, cfg.NumberOfTeams)
+	for team := 1; team <= cfg.NumberOfTeams; team++ {
 		port := cfg.BaseSocksPort + team
-		color := "#607d8b"
-		if team > 0 {
-			color = teamBadgeColors[(team-1)%len(teamBadgeColors)]
-		}
+		color := teamBadgeColors[(team-1)%len(teamBadgeColors)]
 
 		var includes []FoxyProxyPattern
 		if cfg.TeamDomainName != "" && cfg.TeamDomainName != "auto" {
