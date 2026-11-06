@@ -9,14 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/miekg/dns"
-)
-
-const (
-	maxLKGCacheEntries   = 2048
-	dnsUnhealthyCooldown = 15 * time.Second
 )
 
 var (
@@ -24,25 +18,15 @@ var (
 	ErrHostNotFound          = errors.New("unable to resolve host")
 )
 
-type cacheKey struct {
-	team int
-	host string
-}
-
 type Resolver struct {
-	mu             sync.RWMutex
-	cfg            Config
-	cacheMu        sync.RWMutex
-	lkgCache       map[cacheKey]string
-	unhealthyDNS   map[int]time.Time
+	mu  sync.RWMutex
+	cfg Config
 }
 
 func NewResolver(cfg Config) *Resolver {
 	cfg.normalize()
 	return &Resolver{
-		cfg:          cfg,
-		lkgCache:     make(map[cacheKey]string),
-		unhealthyDNS: make(map[int]time.Time),
+		cfg: cfg,
 	}
 }
 
@@ -103,7 +87,7 @@ func (r *Resolver) queryDNS(ctx context.Context, serverAddr string, fqdn string,
 
 func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, error) {
 	cfg := r.ConfigSnapshot()
-	if team < 0 || team > cfg.NumberOfTeams {
+	if team < 1 || team > cfg.NumberOfTeams {
 		return "", ErrDestinationNotAllowed
 	}
 	normalized := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
@@ -118,117 +102,41 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 		return r.TranslateAndValidateIPv4(team, ip.To4().String())
 	}
 
-	if cfg.StaticHostsMode == "override" {
-		if ip, ok := r.lookupStaticHost(cfg, team, normalized); ok {
-			return ip, nil
-		}
-	}
-
 	if cfg.TeamDomainName != "" && cfg.TeamDomainName != "auto" {
 		if !isHostInTeamDomain(normalized, cfg.TeamDomainName) {
-			if _, ok := r.lookupStaticHost(cfg, team, normalized); !ok {
-				return "", ErrDestinationNotAllowed
-			}
-		}
-	}
-
-	var (
-		ips    []net.IP
-		dnsErr error
-	)
-	if int(cfg.TeamDNSServerLastOctet) >= 1 {
-		skipPrimary := false
-		if team > 0 {
-			r.cacheMu.RLock()
-			until, exists := r.unhealthyDNS[team]
-			r.cacheMu.RUnlock()
-			if exists && time.Now().Before(until) {
-				skipPrimary = true
-			}
-		}
-		if !skipPrimary {
-			serverAddr := cfg.TeamDNSServerAddr(team)
-			ips, dnsErr = r.queryDNS(ctx, serverAddr, normalized, cfg)
-		}
-		// If Team N's DNS server is unreachable/refused and Team 0 (golden master pod) exists,
-		// fall back to querying Team 0's DNS server since all team zones are cloned identically.
-		if (skipPrimary || dnsErr != nil || len(ips) == 0) && team > 0 {
-			masterAddr := cfg.TeamDNSServerAddr(0)
-			if masterIPs, masterErr := r.queryDNS(ctx, masterAddr, normalized, cfg); masterErr == nil && len(masterIPs) > 0 {
-				if !skipPrimary && dnsErr != nil {
-					r.cacheMu.Lock()
-					r.unhealthyDNS[team] = time.Now().Add(dnsUnhealthyCooldown)
-					r.cacheMu.Unlock()
-				}
-				ips = masterIPs
-				dnsErr = nil
-			}
-		}
-	} else {
-		dnsErr = errors.New("DNS server octet not yet discovered")
-	}
-
-	if dnsErr == nil && len(ips) > 0 {
-		var sawDisallowed bool
-		for _, ip := range ips {
-			translated, err := r.TranslateAndValidateIPv4(team, ip.String())
-			if err == nil {
-				r.cacheMu.Lock()
-				if len(r.lkgCache) >= maxLKGCacheEntries {
-					clear(r.lkgCache)
-				}
-				r.lkgCache[cacheKey{team: team, host: normalized}] = translated
-				r.cacheMu.Unlock()
-				return translated, nil
-			}
-			if errors.Is(err, ErrDestinationNotAllowed) {
-				sawDisallowed = true
-			}
-		}
-		if sawDisallowed {
-			slog.Warn("DNS returned IP outside team subnet",
-				"team", team,
-				"host", normalized,
-				"ips", ips,
-			)
 			return "", ErrDestinationNotAllowed
 		}
 	}
 
-	if cfg.StaticHostsMode == "fallback" {
-		if ip, ok := r.lookupStaticHost(cfg, team, normalized); ok {
-			slog.Info("Using static_hosts fallback for host",
-				"team", team,
-				"host", normalized,
-				"ip", ip,
-				"dns_error", dnsErr,
-			)
-			return ip, nil
-		}
+	if int(cfg.TeamDNSServerLastOctet) < 1 {
+		return "", fmt.Errorf("%w: DNS server octet not yet discovered", ErrHostNotFound)
 	}
 
-	r.cacheMu.RLock()
-	cachedIP, ok := r.lkgCache[cacheKey{team: team, host: normalized}]
-	r.cacheMu.RUnlock()
-	if ok {
-		slog.Info("Using last-known-good cached DNS record",
-			"team", team,
-			"host", normalized,
-			"ip", cachedIP,
-			"dns_error", dnsErr,
-		)
-		return cachedIP, nil
-	}
-
+	serverAddr := cfg.TeamDNSServerAddr(team)
+	ips, dnsErr := r.queryDNS(ctx, serverAddr, normalized, cfg)
 	if dnsErr != nil {
 		return "", fmt.Errorf("%w: %v", ErrHostNotFound, dnsErr)
 	}
-	return "", ErrHostNotFound
+	if len(ips) == 0 {
+		return "", ErrHostNotFound
+	}
+
+	for _, ip := range ips {
+		if translated, err := r.TranslateAndValidateIPv4(team, ip.String()); err == nil {
+			return translated, nil
+		}
+	}
+	slog.Warn("DNS returned IP outside team subnet",
+		"team", team,
+		"host", normalized,
+		"ips", ips,
+	)
+	return "", ErrDestinationNotAllowed
 }
 
 func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, error) {
 	cfg := r.ConfigSnapshot()
-	if team < 0 || team > cfg.NumberOfTeams {
+	if team < 1 || team > cfg.NumberOfTeams {
 		return "", ErrDestinationNotAllowed
 	}
 	parsed := net.ParseIP(strings.TrimSpace(rawIP))
@@ -252,24 +160,6 @@ func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, err
 		return "", ErrDestinationNotAllowed
 	}
 	return ipStr, nil
-}
-
-func (r *Resolver) lookupStaticHost(cfg Config, team int, normalizedHost string) (string, bool) {
-	if len(cfg.StaticHosts) == 0 {
-		return "", false
-	}
-	octet, ok := cfg.StaticHosts[normalizedHost]
-	if !ok && cfg.TeamDomainName != "" {
-		suffix := "." + cfg.TeamDomainName
-		if strings.HasSuffix(normalizedHost, suffix) {
-			short := strings.TrimSuffix(normalizedHost, suffix)
-			octet, ok = cfg.StaticHosts[short]
-		}
-	}
-	if !ok || octet < 1 || octet > 254 {
-		return "", false
-	}
-	return fmt.Sprintf("%s%d", cfg.TeamExternalPrefix(team), octet), true
 }
 
 func isHostInTeamDomain(normalizedHost, teamDomain string) bool {

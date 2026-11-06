@@ -19,8 +19,6 @@ The configuration schema SHALL accept optional fields with defaults:
 - `dns_timeout_ms` (integer, default `2000`)
 - `dial_timeout_ms` (integer, default `5000`)
 - `idle_timeout_sec` (integer, default `300`)
-- `static_hosts_mode` (string, `"fallback"` or `"override"`, default `"fallback"`)
-- `static_hosts` (map of hostname string to last-octet integer `1..254`, default `{}`)
 
 #### Scenario: Valid configuration file loaded at startup
 - **GIVEN** a JSON configuration file with `number_of_teams: 20`, `internal_mask: "192.168.220."`, `external_mask: "10.100.1xx."`, `team_dns_server_last_octet: "132"`, and `team_domain_name: "example.com"`

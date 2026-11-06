@@ -52,8 +52,8 @@ func ParseTeamUsername(username string, numberOfTeams int) (int, error) {
 		return 0, fmt.Errorf("invalid team identifier in username %q", username)
 	}
 	team, err := strconv.Atoi(u)
-	if err != nil || team < 0 || team > numberOfTeams {
-		return 0, fmt.Errorf("team %q out of range 0..%d", username, numberOfTeams)
+	if err != nil || team < 1 || team > numberOfTeams {
+		return 0, fmt.Errorf("team %q out of range 1..%d", username, numberOfTeams)
 	}
 	return team, nil
 }
@@ -264,13 +264,6 @@ func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int) (int, er
 			return 0, err
 		}
 		return s.readUserPassAuth(conn, fixedTeam)
-	}
-
-	if fixedTeam == 0 && slices.Contains(methods, methodNoAuth) {
-		if _, err := conn.Write([]byte{socks5Version, methodNoAuth}); err != nil {
-			return 0, err
-		}
-		return 0, nil
 	}
 
 	_, _ = conn.Write([]byte{socks5Version, methodNoAcceptable})

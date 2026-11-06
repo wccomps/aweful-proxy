@@ -38,31 +38,38 @@ func DiscoverEnvironment(ctx context.Context, cfg Config) (DiscoveryResult, erro
 		sem        = make(chan struct{}, 64)
 	)
 
-	for team := 0; team <= maxProbeTeam; team++ {
-		prefix := cfg.TeamExternalPrefix(team)
-		for octet := 1; octet <= 254; octet++ {
-			t, o := team, octet
-			ip := fmt.Sprintf("%s%d", prefix, o)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				select {
-				case sem <- struct{}{}:
-					defer func() { <-sem }()
-				case <-ctx.Done():
-					return
-				}
-				conn, err := net.DialTimeout("tcp", ip+":53", 300*time.Millisecond)
-				if err == nil {
-					_ = conn.Close()
-					mu.Lock()
-					candidates = append(candidates, candidate{team: t, octet: o, ip: ip})
-					mu.Unlock()
-				}
-			}()
+	scanTeams := func(startTeam, endTeam int) {
+		for team := startTeam; team <= endTeam; team++ {
+			prefix := cfg.TeamExternalPrefix(team)
+			for octet := 1; octet <= 254; octet++ {
+				t, o := team, octet
+				ip := fmt.Sprintf("%s%d", prefix, o)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					select {
+					case sem <- struct{}{}:
+						defer func() { <-sem }()
+					case <-ctx.Done():
+						return
+					}
+					conn, err := net.DialTimeout("tcp", ip+":53", 300*time.Millisecond)
+					if err == nil {
+						_ = conn.Close()
+						mu.Lock()
+						candidates = append(candidates, candidate{team: t, octet: o, ip: ip})
+						mu.Unlock()
+					}
+				}()
+			}
 		}
+		wg.Wait()
 	}
-	wg.Wait()
+
+	scanTeams(0, maxProbeTeam)
+	if len(candidates) == 0 && cfg.NumberOfTeams > maxProbeTeam {
+		scanTeams(maxProbeTeam+1, cfg.NumberOfTeams)
+	}
 
 	if len(candidates) == 0 {
 		return DiscoveryResult{}, errors.New("no DNS servers found on port 53 across team subnets")

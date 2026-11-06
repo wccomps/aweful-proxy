@@ -38,21 +38,19 @@ func (fo *FlexibleOctet) UnmarshalJSON(b []byte) error {
 }
 
 type Config struct {
-	NumberOfTeams          int            `json:"number_of_teams"`
-	InternalMask           string         `json:"internal_mask"`
-	ExternalMask           string         `json:"external_mask"`
-	TeamDNSServerLastOctet FlexibleOctet  `json:"team_dns_server_last_octet"`
-	TeamDNSServerPort      int            `json:"team_dns_server_port"`
-	TeamDomainName         string         `json:"team_domain_name"`
-	BaseSocksPort          int            `json:"base_socks_port"`
-	SocksListenHost        string         `json:"socks_listen_host"`
-	HTTPListenAddr         string         `json:"http_listen_addr"`
-	ProxyAdvertiseHost     string         `json:"proxy_advertise_host"`
-	DNSTimeoutMs           int            `json:"dns_timeout_ms"`
-	DialTimeoutMs          int            `json:"dial_timeout_ms"`
-	IdleTimeoutSec         int            `json:"idle_timeout_sec"`
-	StaticHostsMode        string         `json:"static_hosts_mode"`
-	StaticHosts            map[string]int `json:"static_hosts"`
+	NumberOfTeams          int           `json:"number_of_teams"`
+	InternalMask           string        `json:"internal_mask"`
+	ExternalMask           string        `json:"external_mask"`
+	TeamDNSServerLastOctet FlexibleOctet `json:"team_dns_server_last_octet"`
+	TeamDNSServerPort      int           `json:"team_dns_server_port"`
+	TeamDomainName         string        `json:"team_domain_name"`
+	BaseSocksPort          int           `json:"base_socks_port"`
+	SocksListenHost        string        `json:"socks_listen_host"`
+	HTTPListenAddr         string        `json:"http_listen_addr"`
+	ProxyAdvertiseHost     string        `json:"proxy_advertise_host"`
+	DNSTimeoutMs           int           `json:"dns_timeout_ms"`
+	DialTimeoutMs          int           `json:"dial_timeout_ms"`
+	IdleTimeoutSec         int           `json:"idle_timeout_sec"`
 }
 
 func DefaultConfig() Config {
@@ -64,8 +62,6 @@ func DefaultConfig() Config {
 		DNSTimeoutMs:      2000,
 		DialTimeoutMs:     5000,
 		IdleTimeoutSec:    300,
-		StaticHostsMode:   "fallback",
-		StaticHosts:       make(map[string]int),
 	}
 }
 
@@ -102,7 +98,6 @@ func applyEnvOverrides(cfg *Config) error {
 		{"AWEFUL_PROXY_SOCKS_LISTEN_HOST", &cfg.SocksListenHost},
 		{"AWEFUL_PROXY_HTTP_LISTEN_ADDR", &cfg.HTTPListenAddr},
 		{"AWEFUL_PROXY_ADVERTISE_HOST", &cfg.ProxyAdvertiseHost},
-		{"AWEFUL_PROXY_STATIC_HOSTS_MODE", &cfg.StaticHostsMode},
 	}
 	for _, b := range strBindings {
 		if v := os.Getenv(b.env); v != "" {
@@ -139,10 +134,6 @@ func (c *Config) normalize() {
 	c.InternalMask = strings.TrimSpace(c.InternalMask)
 	c.ExternalMask = strings.TrimSpace(c.ExternalMask)
 	c.TeamDomainName = strings.ToLower(strings.Trim(strings.TrimSpace(c.TeamDomainName), "."))
-	c.StaticHostsMode = strings.ToLower(strings.TrimSpace(c.StaticHostsMode))
-	if c.StaticHostsMode == "" {
-		c.StaticHostsMode = "fallback"
-	}
 	if c.ExternalMask == "" {
 		c.ExternalMask = "10.100.1xx."
 	}
@@ -152,14 +143,6 @@ func (c *Config) normalize() {
 	if c.TeamDNSServerPort == 0 {
 		c.TeamDNSServerPort = 53
 	}
-	normalizedHosts := make(map[string]int, len(c.StaticHosts))
-	for k, v := range c.StaticHosts {
-		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(k), "."))
-		if host != "" {
-			normalizedHosts[host] = v
-		}
-	}
-	c.StaticHosts = normalizedHosts
 }
 
 func (c *Config) Validate() error {
@@ -173,7 +156,7 @@ func (c *Config) Validate() error {
 	if !strings.Contains(c.ExternalMask, "xx") || !strings.HasSuffix(c.ExternalMask, ".") {
 		return fmt.Errorf("external_mask must contain \"xx\" and end with a dot, e.g. \"10.100.1xx.\" (got %q)", c.ExternalMask)
 	}
-	for team := 0; team <= c.NumberOfTeams; team++ {
+	for team := 1; team <= c.NumberOfTeams; team++ {
 		prefix := c.TeamExternalPrefix(team)
 		if !isValidThreeOctetPrefix(prefix) {
 			return fmt.Errorf("external_mask %q produced invalid IPv4 prefix %q for team %d", c.ExternalMask, prefix, team)
@@ -197,14 +180,6 @@ func (c *Config) Validate() error {
 	}
 	if c.IdleTimeoutSec <= 0 {
 		return fmt.Errorf("idle_timeout_sec must be positive (got %d)", c.IdleTimeoutSec)
-	}
-	if c.StaticHostsMode != "fallback" && c.StaticHostsMode != "override" {
-		return fmt.Errorf("static_hosts_mode must be \"fallback\" or \"override\" (got %q)", c.StaticHostsMode)
-	}
-	for host, octet := range c.StaticHosts {
-		if octet < 1 || octet > 254 {
-			return fmt.Errorf("static_hosts[%q] octet must be between 1 and 254 (got %d)", host, octet)
-		}
 	}
 	return nil
 }
