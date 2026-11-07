@@ -595,7 +595,7 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.NumberOfTeams = 1
 	cfg.InternalMask = "192.168.220."
-	cfg.ExternalMask = "127.1xx.0."
+	cfg.ExternalMask = "10.100.1xx."
 	cfg.TeamDNSServerLastOctet = 10
 	cfg.TeamDomainName = "initial.example"
 	cfg.SocksListenHost = "127.0.0.1"
@@ -615,7 +615,7 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 
 	updateBody := `{
 		"number_of_teams": 2,
-		"external_mask": "127.1xx.0.",
+		"external_mask": "10.100.1xx.",
 		"internal_mask": "192.168.220.",
 		"team_dns_server_last_octet": 53,
 		"team_domain_name": "updated.example"
@@ -651,6 +651,14 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 	}
 	if resolver.ConfigSnapshot().NumberOfTeams != 2 {
 		t.Fatalf("expected NumberOfTeams to remain 2 after rejected POST /config")
+	}
+
+	reqLoopback := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"external_mask": "127.1xx.0."}`))
+	reqLoopback.Header.Set("Content-Type", "application/json")
+	recLoopback := httptest.NewRecorder()
+	handler.ServeHTTP(recLoopback, reqLoopback)
+	if recLoopback.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for loopback external_mask in POST /config, got %d", recLoopback.Code)
 	}
 
 	reqCrossOrigin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 1}`))

@@ -255,7 +255,7 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 			})
 			return
 		}
-		if ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))); ct != "" && !strings.HasPrefix(ct, "application/json") {
+		if ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))); !strings.HasPrefix(ct, "application/json") {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "error",
@@ -281,6 +281,14 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "error",
 				"error":  err.Error(),
+			})
+			return
+		}
+		if extIP, intIP := net.ParseIP(merged.TeamExternalPrefix(0)+"1"), net.ParseIP(merged.InternalMask+"1"); (extIP != nil && extIP.IsLoopback()) || (intIP != nil && intIP.IsLoopback()) {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "loopback prefixes are not allowed in POST /config",
 			})
 			return
 		}

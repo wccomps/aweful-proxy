@@ -231,6 +231,9 @@ func (c *Config) Validate() error {
 	if c.ProxyAdvertiseHost != "" && !isValidHostOrIP(c.ProxyAdvertiseHost) {
 		return fmt.Errorf("invalid proxy_advertise_host %q", c.ProxyAdvertiseHost)
 	}
+	if !isValidHostOrIP(c.TeamDomainName) {
+		return fmt.Errorf("invalid team_domain_name %q", c.TeamDomainName)
+	}
 	if c.DNSTimeoutMs <= 0 {
 		return fmt.Errorf("dns_timeout_ms must be positive (got %d)", c.DNSTimeoutMs)
 	}
@@ -244,11 +247,11 @@ func (c *Config) Validate() error {
 }
 
 func isValidThreeOctetPrefix(prefix string) bool {
-	if !strings.HasSuffix(prefix, ".") {
+	if !strings.HasSuffix(prefix, ".") || strings.Count(prefix, ".") != 3 {
 		return false
 	}
 	ip := net.ParseIP(prefix + "1")
-	return ip != nil && ip.To4() != nil && strings.Count(prefix, ".") == 3
+	return ip != nil && ip.To4() != nil && !ip.IsLinkLocalUnicast() && !ip.IsMulticast() && !ip.IsUnspecified()
 }
 
 func (c Config) TeamExternalPrefix(team int) string {
