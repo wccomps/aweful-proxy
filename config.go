@@ -56,7 +56,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		TeamDNSServerPort: 53,
-		BaseSocksPort:     1080,
+		BaseSocksPort:     8000,
 		SocksListenHost:   "0.0.0.0",
 		HTTPListenAddr:    ":8080",
 		DNSTimeoutMs:      2000,
@@ -85,6 +85,26 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+func SaveConfig(path string, cfg Config) error {
+	if path == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+	data = append(data, '\n')
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return fmt.Errorf("writing temp config file %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("replacing config file %s: %w", path, err)
+	}
+	return nil
 }
 
 func applyEnvOverrides(cfg *Config) error {

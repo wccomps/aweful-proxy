@@ -58,20 +58,26 @@ func ParseTeamUsername(username string, numberOfTeams int) (int, error) {
 	return team, nil
 }
 
+type teamListener struct {
+	addr string
+	ln   net.Listener
+}
+
 type Socks5Server struct {
-	cfg         Config
 	resolver    *Resolver
-	listeners   []net.Listener
+	baseCtx     context.Context
+	closed      bool
+	listeners   map[int]teamListener
 	activeConns map[net.Conn]struct{}
 	connSem     chan struct{}
 	mu          sync.Mutex
 	wg          sync.WaitGroup
 }
 
-func NewSocks5Server(cfg Config, resolver *Resolver) *Socks5Server {
+func NewSocks5Server(_ Config, resolver *Resolver) *Socks5Server {
 	return &Socks5Server{
-		cfg:         cfg,
 		resolver:    resolver,
+		listeners:   make(map[int]teamListener),
 		activeConns: make(map[net.Conn]struct{}),
 		connSem:     make(chan struct{}, maxConcurrentConns),
 	}
@@ -79,18 +85,54 @@ func NewSocks5Server(cfg Config, resolver *Resolver) *Socks5Server {
 
 func (s *Socks5Server) Start(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.baseCtx = ctx
+	s.mu.Unlock()
+	return s.Reconcile(s.resolver.ConfigSnapshot())
+}
 
-	for team := 0; team <= s.cfg.NumberOfTeams; team++ {
-		port := s.cfg.BaseSocksPort + team
-		addr := net.JoinHostPort(s.cfg.SocksListenHost, strconv.Itoa(port))
+func (s *Socks5Server) Reconcile(cfg Config) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("SOCKS5 server is closed")
+	}
+	ctx := s.baseCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for team, tl := range s.listeners {
+		if team <= cfg.NumberOfTeams {
+			wantAddr := net.JoinHostPort(cfg.SocksListenHost, strconv.Itoa(cfg.BaseSocksPort+team))
+			if tl.addr == wantAddr {
+				continue
+			}
+		}
+		_ = tl.ln.Close()
+		delete(s.listeners, team)
+	}
+
+	var newlyOpened []int
+	for team := 0; team <= cfg.NumberOfTeams; team++ {
+		if _, exists := s.listeners[team]; exists {
+			continue
+		}
+		port := cfg.BaseSocksPort + team
+		addr := net.JoinHostPort(cfg.SocksListenHost, strconv.Itoa(port))
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			s.closeLocked()
+			for _, t := range newlyOpened {
+				_ = s.listeners[t].ln.Close()
+				delete(s.listeners, t)
+			}
 			return fmt.Errorf("listening on SOCKS5 port %d (team %d): %w", port, team, err)
 		}
-		s.listeners = append(s.listeners, ln)
+		s.listeners[team] = teamListener{addr: addr, ln: ln}
+		newlyOpened = append(newlyOpened, team)
+	}
 
+	for _, team := range newlyOpened {
+		ln := s.listeners[team].ln
 		fixedTeam := team
 		s.wg.Add(1)
 		go func(l net.Listener, t int) {
@@ -103,6 +145,7 @@ func (s *Socks5Server) Start(ctx context.Context) error {
 
 func (s *Socks5Server) Close() error {
 	s.mu.Lock()
+	s.closed = true
 	s.closeLocked()
 	s.mu.Unlock()
 	s.wg.Wait()
@@ -110,10 +153,10 @@ func (s *Socks5Server) Close() error {
 }
 
 func (s *Socks5Server) closeLocked() {
-	for _, ln := range s.listeners {
-		_ = ln.Close()
+	for team, tl := range s.listeners {
+		_ = tl.ln.Close()
+		delete(s.listeners, team)
 	}
-	s.listeners = nil
 	for conn := range s.activeConns {
 		_ = conn.Close()
 	}
@@ -160,9 +203,10 @@ func (s *Socks5Server) acceptLoop(ctx context.Context, ln net.Listener, fixedTea
 
 func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn, fixedTeam int) {
 	defer clientConn.Close()
-	_ = clientConn.SetDeadline(time.Now().Add(s.cfg.DialTimeout() + s.cfg.DNSTimeout()))
+	cfg := s.resolver.ConfigSnapshot()
+	_ = clientConn.SetDeadline(time.Now().Add(cfg.DialTimeout() + cfg.DNSTimeout()))
 
-	team, err := s.negotiateAuth(clientConn, fixedTeam)
+	team, err := s.negotiateAuth(clientConn, fixedTeam, cfg.NumberOfTeams)
 	if err != nil {
 		slog.Debug("SOCKS5 auth failed", "fixed_team", fixedTeam, "remote", clientConn.RemoteAddr(), "err", err)
 		return
@@ -205,7 +249,7 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 	}
 
 	destAddr := net.JoinHostPort(translatedIP, strconv.Itoa(int(targetPort)))
-	dialer := net.Dialer{Timeout: s.cfg.DialTimeout()}
+	dialer := net.Dialer{Timeout: cfg.DialTimeout()}
 	upstreamConn, err := dialer.DialContext(ctx, "tcp", destAddr)
 	if err != nil {
 		slog.Debug("SOCKS5 upstream dial failed",
@@ -236,10 +280,10 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 
 	_ = clientConn.SetDeadline(time.Time{})
 	_ = upstreamConn.SetDeadline(time.Time{})
-	pipeConnections(clientConn, upstreamConn, s.cfg.IdleTimeout())
+	pipeConnections(clientConn, upstreamConn, cfg.IdleTimeout())
 }
 
-func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int) (int, error) {
+func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam, numberOfTeams int) (int, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return 0, err
@@ -256,7 +300,7 @@ func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int) (int, er
 		if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
 			return 0, err
 		}
-		return s.readUserPassAuth(conn, fixedTeam)
+		return s.readUserPassAuth(conn, fixedTeam, numberOfTeams)
 	}
 
 	if slices.Contains(methods, methodNoAuth) {
@@ -270,14 +314,14 @@ func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int) (int, er
 		if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
 			return 0, err
 		}
-		return s.readUserPassAuth(conn, fixedTeam)
+		return s.readUserPassAuth(conn, fixedTeam, numberOfTeams)
 	}
 
 	_, _ = conn.Write([]byte{socks5Version, methodNoAcceptable})
 	return 0, errors.New("client offered no acceptable auth methods")
 }
 
-func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int) (int, error) {
+func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam, numberOfTeams int) (int, error) {
 	verAndULen := make([]byte, 2)
 	if _, err := io.ReadFull(conn, verAndULen); err != nil {
 		return 0, err
@@ -307,7 +351,7 @@ func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int) (int,
 		return fixedTeam, nil
 	}
 
-	team, err := ParseTeamUsername(string(uname), s.cfg.NumberOfTeams)
+	team, err := ParseTeamUsername(string(uname), numberOfTeams)
 	if err != nil || (fixedTeam > 0 && team != fixedTeam) {
 		_, _ = conn.Write([]byte{authVersion, 0x01})
 		if err != nil {

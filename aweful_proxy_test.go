@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -515,7 +516,6 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 	cfg.ExternalMask = "10.100.1xx."
 	cfg.TeamDNSServerLastOctet = 132
 	cfg.TeamDomainName = "example.com"
-	cfg.BaseSocksPort = 1080
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -554,15 +554,129 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 		t.Fatalf("expected Passthrough %q, got %q", wantPassthrough, export.Passthrough)
 	}
 	team0 := export.Data[0]
-	if team0.Title != "Team 00" || team0.Type != "socks5" || team0.Hostname != "192.0.2.10" || team0.Port != "1080" || !team0.ProxyDNS {
+	if team0.Title != "Team 00" || team0.Type != "socks5" || team0.Hostname != "192.0.2.10" || team0.Port != "8000" || !team0.ProxyDNS {
 		t.Fatalf("unexpected Team 00 entry: %+v", team0)
 	}
 	first := export.Data[1]
-	if first.Title != "Team 01" || first.Type != "socks5" || first.Hostname != "192.0.2.10" || first.Port != "1081" || !first.ProxyDNS {
+	if first.Title != "Team 01" || first.Type != "socks5" || first.Hostname != "192.0.2.10" || first.Port != "8001" || !first.ProxyDNS {
 		t.Fatalf("unexpected Team 01 entry: %+v", first)
 	}
 	last := export.Data[20]
-	if last.Title != "Team 20" || last.Port != "1100" {
+	if last.Title != "Team 20" || last.Port != "8020" {
 		t.Fatalf("unexpected Team 20 entry: %+v", last)
+	}
+
+	reqStatus := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:8080/", nil)
+	recStatus := httptest.NewRecorder()
+	handler.ServeHTTP(recStatus, reqStatus)
+	if recStatus.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /, got %d", recStatus.Code)
+	}
+	statusHTML := recStatus.Body.String()
+	for _, wantSub := range []string{"example.com", "10.100.1xx.132:53", "192.0.2.10:8000", "192.0.2.10:8020", "/foxyproxy.json"} {
+		if !strings.Contains(statusHTML, wantSub) {
+			t.Fatalf("expected GET / HTML to contain %q", wantSub)
+		}
+	}
+
+	reqNotFound := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:8080/nonexistent", nil)
+	recNotFound := httptest.NewRecorder()
+	handler.ServeHTTP(recNotFound, reqNotFound)
+	if recNotFound.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 from GET /nonexistent, got %d", recNotFound.Code)
+	}
+}
+
+func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+
+	cfg := DefaultConfig()
+	cfg.NumberOfTeams = 1
+	cfg.InternalMask = "192.168.220."
+	cfg.ExternalMask = "127.1xx.0."
+	cfg.TeamDNSServerLastOctet = 10
+	cfg.TeamDomainName = "initial.example"
+	cfg.SocksListenHost = "127.0.0.1"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		resolver *Resolver
+		srv      *Socks5Server
+		basePort int
+	)
+	for attempt := 0; attempt < 10; attempt++ {
+		probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to probe free port: %v", err)
+		}
+		basePort = probeLn.Addr().(*net.TCPAddr).Port
+		_ = probeLn.Close()
+
+		cfg.BaseSocksPort = basePort
+		if err := cfg.Validate(); err != nil {
+			continue
+		}
+		resolver = NewResolver(cfg)
+		srv = NewSocks5Server(cfg, resolver)
+		if err := srv.Start(ctx); err == nil {
+			break
+		}
+	}
+	if srv == nil {
+		t.Fatal("failed to start SOCKS5 server")
+	}
+	defer srv.Close()
+
+	handler := NewHTTPHandler(resolver, WithSocksServer(srv), WithConfigPath(cfgPath))
+
+	// Initially Team 2 port (basePort+2) should not be listening.
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+2), 100*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatalf("expected port %d not to be listening before POST /config", basePort+2)
+	}
+
+	// Push updated config with 2 teams and updated domain/DNS octet.
+	updateBody := `{
+		"number_of_teams": 2,
+		"external_mask": "127.1xx.0.",
+		"internal_mask": "192.168.220.",
+		"team_dns_server_last_octet": 53,
+		"team_domain_name": "updated.example"
+	}`
+	reqPost := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(updateBody))
+	recPost := httptest.NewRecorder()
+	handler.ServeHTTP(recPost, reqPost)
+	if recPost.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /config, got %d: %s", recPost.Code, recPost.Body.String())
+	}
+
+	// Team 2 port (basePort+2) should now be listening.
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+2), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected port %d to be listening after POST /config: %v", basePort+2, err)
+	}
+	_ = c.Close()
+
+	// Persisted config on disk should match the update.
+	savedCfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(cfgPath) failed: %v", err)
+	}
+	if savedCfg.NumberOfTeams != 2 || savedCfg.TeamDomainName != "updated.example" || int(savedCfg.TeamDNSServerLastOctet) != 53 {
+		t.Fatalf("unexpected savedCfg: %+v", savedCfg)
+	}
+
+	// Invalid POST /config should return 400 and leave current config intact.
+	reqBad := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 0}`))
+	recBad := httptest.NewRecorder()
+	handler.ServeHTTP(recBad, reqBad)
+	if recBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 from invalid POST /config, got %d", recBad.Code)
+	}
+	if resolver.ConfigSnapshot().NumberOfTeams != 2 {
+		t.Fatalf("expected NumberOfTeams to remain 2 after rejected POST /config")
 	}
 }
