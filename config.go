@@ -266,7 +266,7 @@ func (c *Config) Validate() error {
 		if !isValidThreeOctetPrefix(prefix) {
 			return fmt.Errorf("external_mask %q produced invalid IPv4 prefix %q for team %d", c.ExternalMask, prefix, team)
 		}
-		if overlapsLocalInterfaceSubnet(net.ParseIP(prefix+"1"), true) {
+		if overlapsLocalInterfaceSubnet(net.ParseIP(prefix + "1")) {
 			return fmt.Errorf("external_mask %q overlaps a local host network interface (%s0/24)", c.ExternalMask, prefix)
 		}
 	}

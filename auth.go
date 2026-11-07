@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +26,8 @@ const (
 	oauthStateTTL     = 5 * time.Minute
 	defaultSessionTTL = 12 * time.Hour
 )
+
+var errForbiddenGroup = errors.New("user does not belong to an authorized staff group")
 
 var defaultStaffGroups = []string{
 	"WCComps_Discord_Admin",
@@ -42,7 +44,6 @@ var defaultStaffGroups = []string{
 var defaultTrustedProxyCIDRs = []string{
 	"127.0.0.1/32",
 	"::1/128",
-	"172.16.0.0/12",
 }
 
 type AuthIdentity struct {
@@ -53,7 +54,6 @@ type AuthIdentity struct {
 
 type ipLease struct {
 	username  string
-	groups    []string
 	expiresAt time.Time
 }
 
@@ -108,7 +108,6 @@ func (a *Authenticator) AuthorizeIP(ipStr string, id AuthIdentity) {
 	}
 	a.leases[host] = ipLease{
 		username:  id.Username,
-		groups:    id.Groups,
 		expiresAt: time.Unix(id.ExpiresAt, 0),
 	}
 }
@@ -199,7 +198,7 @@ func (a *Authenticator) AuthenticateRequest(cfg Config, r *http.Request) (*AuthI
 		if user := strings.TrimSpace(r.Header.Get("X-authentik-username")); user != "" {
 			groups := splitAuthentikGroups(r.Header.Get("X-authentik-groups"))
 			if !hasAllowedGroup(cfg, groups) {
-				return nil, fmt.Errorf("user %q does not belong to an authorized staff group", user)
+				return nil, fmt.Errorf("%w: %q", errForbiddenGroup, user)
 			}
 			id := &AuthIdentity{
 				Username:  user,
@@ -223,7 +222,7 @@ func (a *Authenticator) AuthenticateRequest(cfg Config, r *http.Request) (*AuthI
 		return nil, errors.New("session expired")
 	}
 	if !hasAllowedGroup(cfg, id.Groups) {
-		return nil, fmt.Errorf("user %q does not belong to an authorized staff group", id.Username)
+		return nil, fmt.Errorf("%w: %q", errForbiddenGroup, id.Username)
 	}
 	a.AuthorizeIP(ClientIPFromRequest(cfg, r), id)
 	return &id, nil
@@ -429,7 +428,14 @@ func (a *Authenticator) HandleCallback(cfg Config, w http.ResponseWriter, r *htt
 }
 
 func (a *Authenticator) HandleLogout(cfg Config, w http.ResponseWriter, r *http.Request) {
-	a.RevokeIP(ClientIPFromRequest(cfg, r))
+	secFetch := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	if secFetch != "" && secFetch != "same-origin" && secFetch != "none" {
+		http.Error(w, "Forbidden: cross-origin logout rejected", http.StatusForbidden)
+		return
+	}
+	if _, err := a.AuthenticateRequest(cfg, r); err == nil {
+		a.RevokeIP(ClientIPFromRequest(cfg, r))
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
@@ -497,10 +503,8 @@ func hasAllowedGroup(cfg Config, userGroups []string) bool {
 		allowed = defaultStaffGroups
 	}
 	for _, want := range allowed {
-		for _, got := range userGroups {
-			if got == want {
-				return true
-			}
+		if slices.Contains(userGroups, want) {
+			return true
 		}
 	}
 	return false
@@ -509,13 +513,12 @@ func hasAllowedGroup(cfg Config, userGroups []string) bool {
 func ClientIPFromRequest(cfg Config, r *http.Request) string {
 	peerIP := normalizeIPString(r.RemoteAddr)
 	if isTrustedProxyPeer(cfg, r.RemoteAddr) {
-		if cfIP := normalizeIPString(r.Header.Get("CF-Connecting-IP")); cfIP != "" {
-			return cfIP
-		}
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first, _, _ := strings.Cut(xff, ",")
-			if ip := normalizeIPString(first); ip != "" {
-				return ip
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				if ip := normalizeIPString(parts[i]); ip != "" {
+					return ip
+				}
 			}
 		}
 	}
@@ -589,12 +592,9 @@ func ipMatchesAnyCIDR(ip net.IP, cidrs []string) bool {
 	return false
 }
 
-func overlapsLocalInterfaceSubnet(ip net.IP, allowLoopback bool) bool {
-	if ip == nil {
-		return true
-	}
-	if ip.IsLoopback() {
-		return !allowLoopback
+func overlapsLocalInterfaceSubnet(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() {
+		return false
 	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -612,7 +612,7 @@ func overlapsLocalInterfaceSubnet(ip net.IP, allowLoopback bool) bool {
 	return false
 }
 
-func CheckSocksAuth(ctx context.Context, auth *Authenticator, cfg Config, clientAddr string, username, password string) (string, bool) {
+func CheckSocksAuth(auth *Authenticator, cfg Config, clientAddr string, username, password string) (string, bool) {
 	if auth == nil || !auth.Enabled(cfg) {
 		return "", true
 	}

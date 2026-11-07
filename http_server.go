@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -102,7 +103,7 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!DOCTYPE html>
 <body>
 <h1>aweful-proxy</h1>
 {{if .AuthUser}}
-<p>Signed in via Authentik SSO as <code>{{.AuthUser}}</code> (SOCKS5 access authorized for <code>{{.ClientIP}}</code>). <a href="/auth/logout">Sign out</a></p>
+<form method="post" action="/auth/logout" style="margin: 0.5rem 0;">Signed in via Authentik SSO as <code>{{.AuthUser}}</code> (SOCKS5 access authorized for <code>{{.ClientIP}}</code>). <button type="submit">Sign out</button></form>
 {{end}}
 
 <h2>Active Configuration</h2>
@@ -162,10 +163,7 @@ curl -x socks5h://{{.ProxyHost}}:{{.BasePort}} http://{{.ExampleHost}}/</pre>
 func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath string) http.Handler {
 	var configMu sync.Mutex
 	mux := http.NewServeMux()
-	auth := NewAuthenticator(resolver.ConfigSnapshot().SessionSecret)
-	if socksServer != nil {
-		socksServer.SetAuthenticator(auth)
-	}
+	auth := resolver.Auth()
 
 	requireStaffAuth := func(cfg Config, w http.ResponseWriter, r *http.Request) (*AuthIdentity, bool) {
 		if !auth.Enabled(cfg) {
@@ -175,7 +173,7 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 		if err == nil {
 			return id, true
 		}
-		if strings.Contains(err.Error(), "authorized staff group") {
+		if errors.Is(err, errForbiddenGroup) {
 			http.Error(w, "Forbidden: your Authentik account is not in an authorized staff group", http.StatusForbidden)
 			return nil, false
 		}
@@ -193,7 +191,7 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 	mux.HandleFunc("GET /auth/callback", func(w http.ResponseWriter, r *http.Request) {
 		auth.HandleCallback(resolver.ConfigSnapshot(), w, r)
 	})
-	mux.HandleFunc("GET /auth/logout", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /auth/logout", func(w http.ResponseWriter, r *http.Request) {
 		auth.HandleLogout(resolver.ConfigSnapshot(), w, r)
 	})
 
@@ -348,7 +346,7 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 			})
 			return
 		}
-		if extIP, intIP := net.ParseIP(merged.TeamExternalPrefix(0)+"1"), net.ParseIP(merged.InternalMask+"1"); (extIP != nil && extIP.IsLoopback()) || (intIP != nil && intIP.IsLoopback()) {
+		if hasLoopbackPrefix(merged) {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "error",
@@ -413,12 +411,21 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 	})
 }
 
+func hasLoopbackPrefix(cfg Config) bool {
+	if intIP := net.ParseIP(cfg.InternalMask + "1"); intIP != nil && intIP.IsLoopback() {
+		return true
+	}
+	for team := 0; team <= cfg.NumberOfTeams; team++ {
+		if extIP := net.ParseIP(cfg.TeamExternalPrefix(team) + "1"); extIP != nil && extIP.IsLoopback() {
+			return true
+		}
+	}
+	return false
+}
+
 func resolveAdvertiseHost(cfg Config, r *http.Request) string {
 	if cfg.ProxyAdvertiseHost != "" {
 		return cfg.ProxyAdvertiseHost
-	}
-	if qHost := strings.TrimSpace(r.URL.Query().Get("host")); isValidHostOrIP(qHost) {
-		return qHost
 	}
 	if r.Host != "" {
 		candidate := r.Host

@@ -66,7 +66,6 @@ type teamListener struct {
 
 type Socks5Server struct {
 	resolver    *Resolver
-	auth        *Authenticator
 	baseCtx     context.Context
 	closed      bool
 	listeners   map[int]teamListener
@@ -85,12 +84,6 @@ func NewSocks5Server(resolver *Resolver) *Socks5Server {
 		clientConns: make(map[string]int),
 		connSem:     make(chan struct{}, maxConcurrentConns),
 	}
-}
-
-func (s *Socks5Server) SetAuthenticator(auth *Authenticator) {
-	s.mu.Lock()
-	s.auth = auth
-	s.mu.Unlock()
 }
 
 func (s *Socks5Server) Start(ctx context.Context) error {
@@ -170,20 +163,27 @@ func (s *Socks5Server) closeLocked() {
 	}
 }
 
-func (s *Socks5Server) trackConn(conn net.Conn, active bool) {
+func (s *Socks5Server) trackConn(conn net.Conn, active bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if active {
+		if s.closed {
+			return false
+		}
 		s.activeConns[conn] = struct{}{}
 	} else {
 		delete(s.activeConns, conn)
 	}
+	return true
 }
 
 func (s *Socks5Server) acquireClientConn(conn net.Conn) (string, bool) {
 	clientIP := normalizeIPString(conn.RemoteAddr().String())
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return "", false
+	}
 	if clientIP != "" && s.clientConns[clientIP] >= maxConnsPerClient {
 		return "", false
 	}
@@ -251,7 +251,7 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 	}
 	_ = clientConn.SetDeadline(time.Now().Add(cfg.DialTimeout() + cfg.DNSTimeout()))
 
-	team, authUser, err := s.negotiateAuth(ctx, clientConn, fixedTeam, cfg, remoteStr)
+	team, authUser, err := s.negotiateAuth(clientConn, fixedTeam, cfg, remoteStr)
 	if err != nil {
 		slog.Debug("SOCKS5 auth failed", "fixed_team", fixedTeam, "remote", remoteStr, "err", err)
 		return
@@ -307,7 +307,10 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 		_ = writeSocks5Reply(clientConn, classifyDialError(err))
 		return
 	}
-	s.trackConn(upstreamConn, true)
+	if !s.trackConn(upstreamConn, true) {
+		_ = upstreamConn.Close()
+		return
+	}
 	defer func() {
 		s.trackConn(upstreamConn, false)
 		_ = upstreamConn.Close()
@@ -330,7 +333,7 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 	pipeConnections(clientConn, upstreamConn, cfg.IdleTimeout())
 }
 
-func (s *Socks5Server) negotiateAuth(ctx context.Context, conn io.ReadWriter, fixedTeam int, cfg Config, remoteAddr string) (int, string, error) {
+func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int, cfg Config, remoteAddr string) (int, string, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return 0, "", err
@@ -343,19 +346,9 @@ func (s *Socks5Server) negotiateAuth(ctx context.Context, conn io.ReadWriter, fi
 		return 0, "", err
 	}
 
-	s.mu.Lock()
-	auth := s.auth
-	s.mu.Unlock()
-
-	if fixedTeam == 0 && slices.Contains(methods, methodUserPass) {
-		if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
-			return 0, "", err
-		}
-		return s.readUserPassAuth(ctx, conn, fixedTeam, cfg, auth, remoteAddr)
-	}
-
-	if slices.Contains(methods, methodNoAuth) {
-		if authUser, ok := CheckSocksAuth(ctx, auth, cfg, remoteAddr, "", ""); ok {
+	auth := s.resolver.Auth()
+	if slices.Contains(methods, methodNoAuth) && (fixedTeam > 0 || !slices.Contains(methods, methodUserPass)) {
+		if authUser, ok := CheckSocksAuth(auth, cfg, remoteAddr, "", ""); ok {
 			if _, err := conn.Write([]byte{socks5Version, methodNoAuth}); err != nil {
 				return 0, "", err
 			}
@@ -367,14 +360,14 @@ func (s *Socks5Server) negotiateAuth(ctx context.Context, conn io.ReadWriter, fi
 		if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
 			return 0, "", err
 		}
-		return s.readUserPassAuth(ctx, conn, fixedTeam, cfg, auth, remoteAddr)
+		return s.readUserPassAuth(conn, fixedTeam, cfg, auth, remoteAddr)
 	}
 
 	_, _ = conn.Write([]byte{socks5Version, methodNoAcceptable})
 	return 0, "", errors.New("client offered no acceptable or authorized auth methods")
 }
 
-func (s *Socks5Server) readUserPassAuth(ctx context.Context, conn io.ReadWriter, fixedTeam int, cfg Config, auth *Authenticator, remoteAddr string) (int, string, error) {
+func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int, cfg Config, auth *Authenticator, remoteAddr string) (int, string, error) {
 	verAndULen := make([]byte, 2)
 	if _, err := io.ReadFull(conn, verAndULen); err != nil {
 		return 0, "", err
@@ -403,7 +396,7 @@ func (s *Socks5Server) readUserPassAuth(ctx context.Context, conn io.ReadWriter,
 		return 0, "", err
 	}
 
-	authUser, ok := CheckSocksAuth(ctx, auth, cfg, remoteAddr, candidateUser, string(passwd))
+	authUser, ok := CheckSocksAuth(auth, cfg, remoteAddr, candidateUser, string(passwd))
 	if !ok {
 		_, _ = conn.Write([]byte{authVersion, 0x01})
 		return 0, "", errors.New("SOCKS5 SSO authentication failed")
@@ -424,20 +417,18 @@ func parseTeamAndUser(rawUsername string, fixedTeam, numberOfTeams int) (int, st
 		return 0, "", errors.New("empty username on base port")
 	}
 	if teamPart, userPart, ok := strings.Cut(trimmed, "+"); ok {
-		team, err := ParseTeamUsername(teamPart, numberOfTeams)
-		if err != nil {
-			return 0, "", err
+		if team, err := ParseTeamUsername(teamPart, numberOfTeams); err == nil {
+			if fixedTeam > 0 && team != fixedTeam {
+				return 0, "", fmt.Errorf("username team %d does not match port team %d", team, fixedTeam)
+			}
+			return team, strings.TrimSpace(userPart), nil
 		}
-		if fixedTeam > 0 && team != fixedTeam {
-			return 0, "", fmt.Errorf("username team %d does not match port team %d", team, fixedTeam)
-		}
-		return team, strings.TrimSpace(userPart), nil
 	}
 	if team, err := ParseTeamUsername(trimmed, numberOfTeams); err == nil {
 		if fixedTeam > 0 && team != fixedTeam {
 			return 0, "", fmt.Errorf("username team %d does not match port team %d", team, fixedTeam)
 		}
-		return team, "", nil
+		return team, trimmed, nil
 	}
 	if fixedTeam > 0 {
 		return fixedTeam, trimmed, nil

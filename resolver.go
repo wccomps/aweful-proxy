@@ -19,15 +19,21 @@ var (
 )
 
 type Resolver struct {
-	mu  sync.RWMutex
-	cfg Config
+	mu   sync.RWMutex
+	cfg  Config
+	auth *Authenticator
 }
 
 func NewResolver(cfg Config) *Resolver {
 	cfg.normalize()
 	return &Resolver{
-		cfg: cfg,
+		cfg:  cfg,
+		auth: NewAuthenticator(cfg.SessionSecret),
 	}
+}
+
+func (r *Resolver) Auth() *Authenticator {
+	return r.auth
 }
 
 func (r *Resolver) ConfigSnapshot() Config {
@@ -155,7 +161,7 @@ func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, err
 	if err != nil || octet < 1 || octet > 254 {
 		return "", ErrDestinationNotAllowed
 	}
-	if overlapsLocalInterfaceSubnet(net.ParseIP(ipStr), true) {
+	if overlapsLocalInterfaceSubnet(net.ParseIP(ipStr)) {
 		return "", ErrDestinationNotAllowed
 	}
 	return ipStr, nil

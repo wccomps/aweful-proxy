@@ -675,7 +675,7 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 		t.Fatalf("expected NumberOfTeams to remain 2 after rejected POST /config")
 	}
 
-	reqLoopback := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"external_mask": "127.1xx.0."}`))
+	reqLoopback := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"external_mask": "1xx.0.0.", "number_of_teams": 27}`))
 	reqLoopback.Header.Set("Content-Type", "application/json")
 	reqLoopback.Header.Set("Authorization", "Bearer test-secret-token")
 	recLoopback := httptest.NewRecorder()
@@ -770,12 +770,22 @@ func TestAuthentikSSOForwardAuthAndSocks5LeaseAndToken(t *testing.T) {
 		t.Fatalf("expected SOCKS5 methodNoAuth (0x00) after SSO login granted IP lease, got 0x%02x", respLeased[1])
 	}
 
-	reqLogout := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/auth/logout", nil)
+	reqUnauthLogout := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/auth/logout", nil)
+	reqUnauthLogout.RemoteAddr = "127.0.0.1:50000"
+	recUnauthLogout := httptest.NewRecorder()
+	handler.ServeHTTP(recUnauthLogout, reqUnauthLogout)
+	if _, ok := resolver.Auth().LookupIPLease("127.0.0.1"); !ok {
+		t.Fatalf("expected unauthenticated POST /auth/logout not to revoke active IP lease")
+	}
+
+	reqLogout := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/auth/logout", nil)
 	reqLogout.RemoteAddr = "127.0.0.1:50000"
+	reqLogout.Header.Set("X-authentik-username", "alice")
+	reqLogout.Header.Set("X-authentik-groups", "WCComps_OrangeTeam")
 	recLogout := httptest.NewRecorder()
 	handler.ServeHTTP(recLogout, reqLogout)
 	if recLogout.Code != http.StatusFound {
-		t.Fatalf("expected 302 from /auth/logout, got %d", recLogout.Code)
+		t.Fatalf("expected 302 from POST /auth/logout, got %d", recLogout.Code)
 	}
 
 	connAfterLogout, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
@@ -787,12 +797,12 @@ func TestAuthentikSSOForwardAuthAndSocks5LeaseAndToken(t *testing.T) {
 	_, _ = io.ReadFull(connAfterLogout, respAfterLogout)
 	_ = connAfterLogout.Close()
 	if respAfterLogout[1] != methodNoAcceptable {
-		t.Fatalf("expected SOCKS5 methodNoAcceptable (0xFF) after /auth/logout, got 0x%02x", respAfterLogout[1])
+		t.Fatalf("expected SOCKS5 methodNoAcceptable (0xFF) after POST /auth/logout, got 0x%02x", respAfterLogout[1])
 	}
 
-	auth := NewAuthenticator(cfg.SessionSecret)
-	token := auth.IssueSocksToken(AuthIdentity{
-		Username:  "alice",
+	plusUser := "alice+staff@example.com"
+	token := resolver.Auth().IssueSocksToken(AuthIdentity{
+		Username:  plusUser,
 		ExpiresAt: time.Now().Add(time.Hour).Unix(),
 	})
 
@@ -806,8 +816,8 @@ func TestAuthentikSSOForwardAuthAndSocks5LeaseAndToken(t *testing.T) {
 	if respMethod[1] != methodUserPass {
 		t.Fatalf("expected methodUserPass (0x02), got 0x%02x", respMethod[1])
 	}
-	authPacket := []byte{0x01, byte(len("alice"))}
-	authPacket = append(authPacket, []byte("alice")...)
+	authPacket := []byte{0x01, byte(len(plusUser))}
+	authPacket = append(authPacket, []byte(plusUser)...)
 	authPacket = append(authPacket, byte(len(token)))
 	authPacket = append(authPacket, []byte(token)...)
 	_, _ = connToken.Write(authPacket)
