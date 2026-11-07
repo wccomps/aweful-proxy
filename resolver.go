@@ -87,7 +87,7 @@ func (r *Resolver) queryDNS(ctx context.Context, serverAddr string, fqdn string,
 
 func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, error) {
 	cfg := r.ConfigSnapshot()
-	if team < 1 || team > cfg.NumberOfTeams {
+	if team < 0 || team > cfg.NumberOfTeams {
 		return "", ErrDestinationNotAllowed
 	}
 	normalized := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
@@ -136,7 +136,7 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 
 func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, error) {
 	cfg := r.ConfigSnapshot()
-	if team < 1 || team > cfg.NumberOfTeams {
+	if team < 0 || team > cfg.NumberOfTeams {
 		return "", ErrDestinationNotAllowed
 	}
 	parsed := net.ParseIP(strings.TrimSpace(rawIP))

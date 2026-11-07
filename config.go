@@ -156,7 +156,7 @@ func (c *Config) Validate() error {
 	if !strings.Contains(c.ExternalMask, "xx") || !strings.HasSuffix(c.ExternalMask, ".") {
 		return fmt.Errorf("external_mask must contain \"xx\" and end with a dot, e.g. \"10.100.1xx.\" (got %q)", c.ExternalMask)
 	}
-	for team := 1; team <= c.NumberOfTeams; team++ {
+	for team := 0; team <= c.NumberOfTeams; team++ {
 		prefix := c.TeamExternalPrefix(team)
 		if !isValidThreeOctetPrefix(prefix) {
 			return fmt.Errorf("external_mask %q produced invalid IPv4 prefix %q for team %d", c.ExternalMask, prefix, team)

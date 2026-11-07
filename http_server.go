@@ -145,10 +145,10 @@ func isValidHostOrIP(s string) bool {
 }
 
 func BuildFoxyProxyConfig(cfg Config, proxyHost string) FoxyProxyExport {
-	entries := make([]FoxyProxyEntry, 0, cfg.NumberOfTeams)
-	for team := 1; team <= cfg.NumberOfTeams; team++ {
+	entries := make([]FoxyProxyEntry, 0, cfg.NumberOfTeams+1)
+	for team := 0; team <= cfg.NumberOfTeams; team++ {
 		port := cfg.BaseSocksPort + team
-		color := teamBadgeColors[(team-1)%len(teamBadgeColors)]
+		color := teamBadgeColors[team%len(teamBadgeColors)]
 
 		var includes []FoxyProxyPattern
 		if cfg.TeamDomainName != "" && cfg.TeamDomainName != "auto" {

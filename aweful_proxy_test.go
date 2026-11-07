@@ -83,6 +83,9 @@ func TestInvalidConfigsRejected(t *testing.T) {
 
 func TestParseTeamUsername(t *testing.T) {
 	valid := map[string]int{
+		"team0":   0,
+		"team00":  0,
+		"0":       0,
 		"team1":   1,
 		"team01":  1,
 		"TEAM20":  20,
@@ -98,7 +101,7 @@ func TestParseTeamUsername(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"", "team", "team0", "0", "team21", "-1", "_1", "team-_1", "+1", "admin"}
+	invalid := []string{"", "team", "team21", "-1", "_1", "team-_1", "+1", "admin"}
 	for _, input := range invalid {
 		if got, err := ParseTeamUsername(input, 20); err == nil {
 			t.Fatalf("ParseTeamUsername(%q) = %d, expected error", input, got)
@@ -232,8 +235,8 @@ func TestResolverPerTeamDNSAndSecurity(t *testing.T) {
 		}
 	}
 
-	if _, err := resolver.Resolve(ctx, 0, "app.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
-		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team 0, got %v", err)
+	if _, err := resolver.Resolve(ctx, 7, "app.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
+		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team 7, got %v", err)
 	}
 	if _, err := resolver.Resolve(ctx, -1, "app.example.com"); !errors.Is(err, ErrDestinationNotAllowed) {
 		t.Fatalf("expected ErrDestinationNotAllowed for out-of-range team -1, got %v", err)
@@ -543,18 +546,22 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 	if err := json.Unmarshal(recFoxy.Body.Bytes(), &export); err != nil {
 		t.Fatalf("invalid foxyproxy JSON: %v", err)
 	}
-	if len(export.Data) != 20 {
-		t.Fatalf("expected 20 FoxyProxy entries, got %d", len(export.Data))
+	if len(export.Data) != 21 {
+		t.Fatalf("expected 21 FoxyProxy entries (Team 00..Team 20), got %d", len(export.Data))
 	}
 	wantPassthrough := "(?![^/]+.example.com|example.com|192.168.220.|10.100.1)*"
 	if export.Passthrough != wantPassthrough {
 		t.Fatalf("expected Passthrough %q, got %q", wantPassthrough, export.Passthrough)
 	}
-	first := export.Data[0]
+	team0 := export.Data[0]
+	if team0.Title != "Team 00" || team0.Type != "socks5" || team0.Hostname != "192.0.2.10" || team0.Port != "1080" || !team0.ProxyDNS {
+		t.Fatalf("unexpected Team 00 entry: %+v", team0)
+	}
+	first := export.Data[1]
 	if first.Title != "Team 01" || first.Type != "socks5" || first.Hostname != "192.0.2.10" || first.Port != "1081" || !first.ProxyDNS {
 		t.Fatalf("unexpected Team 01 entry: %+v", first)
 	}
-	last := export.Data[19]
+	last := export.Data[20]
 	if last.Title != "Team 20" || last.Port != "1100" {
 		t.Fatalf("unexpected Team 20 entry: %+v", last)
 	}
