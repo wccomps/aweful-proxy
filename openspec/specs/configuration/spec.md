@@ -13,7 +13,7 @@ The configuration schema SHALL require:
 - `team_domain_name` (string, e.g., `"example.com"`)
 
 The configuration schema SHALL accept optional fields with defaults:
-- `base_socks_port` (integer, default `1080`)
+- `base_socks_port` (integer, default `8000`)
 - `http_listen_addr` (string, default `":8080"`)
 - `proxy_advertise_host` (string, default `""` — falls back to HTTP `Host` header host)
 - `dns_timeout_ms` (integer, default `2000`)

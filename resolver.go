@@ -19,15 +19,21 @@ var (
 )
 
 type Resolver struct {
-	mu  sync.RWMutex
-	cfg Config
+	mu   sync.RWMutex
+	cfg  Config
+	auth *Authenticator
 }
 
 func NewResolver(cfg Config) *Resolver {
 	cfg.normalize()
 	return &Resolver{
-		cfg: cfg,
+		cfg:  cfg,
+		auth: NewAuthenticator(cfg.SessionSecret),
 	}
+}
+
+func (r *Resolver) Auth() *Authenticator {
+	return r.auth
 }
 
 func (r *Resolver) ConfigSnapshot() Config {
@@ -36,14 +42,10 @@ func (r *Resolver) ConfigSnapshot() Config {
 	return r.cfg
 }
 
-func (r *Resolver) UpdateDiscovery(dnsOctet int, domain string) {
+func (r *Resolver) UpdateConfig(cfg Config) {
+	cfg.normalize()
 	r.mu.Lock()
-	if dnsOctet >= 1 && dnsOctet <= 254 {
-		r.cfg.TeamDNSServerLastOctet = FlexibleOctet(dnsOctet)
-	}
-	if domain != "" && domain != "auto" {
-		r.cfg.TeamDomainName = strings.ToLower(strings.Trim(domain, "."))
-	}
+	r.cfg = cfg
 	r.mu.Unlock()
 }
 
@@ -102,14 +104,14 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 		return r.TranslateAndValidateIPv4(team, ip.To4().String())
 	}
 
-	if cfg.TeamDomainName != "" && cfg.TeamDomainName != "auto" {
+	if cfg.TeamDomainName != "" {
 		if !isHostInTeamDomain(normalized, cfg.TeamDomainName) {
 			return "", ErrDestinationNotAllowed
 		}
 	}
 
 	if int(cfg.TeamDNSServerLastOctet) < 1 {
-		return "", fmt.Errorf("%w: DNS server octet not yet discovered", ErrHostNotFound)
+		return "", fmt.Errorf("%w: DNS server octet not configured", ErrHostNotFound)
 	}
 
 	serverAddr := cfg.TeamDNSServerAddr(team)
@@ -157,6 +159,9 @@ func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, err
 	lastOctetStr := strings.TrimPrefix(ipStr, teamPrefix)
 	octet, err := strconv.Atoi(lastOctetStr)
 	if err != nil || octet < 1 || octet > 254 {
+		return "", ErrDestinationNotAllowed
+	}
+	if overlapsLocalInterfaceSubnet(net.ParseIP(ipStr)) {
 		return "", ErrDestinationNotAllowed
 	}
 	return ipStr, nil

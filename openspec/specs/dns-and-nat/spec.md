@@ -7,7 +7,7 @@ When handling a `DOMAINNAME` (`ATYP = 0x03`) request on Team `N`'s proxy, the sy
 
 #### Scenario: Team DNS returns internal IP
 - **GIVEN** Team 6 has external prefix `"10.100.106."`, `internal_mask` is `"192.168.220."`, and `team_dns_server_last_octet` is `"132"`
-- **WHEN** a client on port `1086` requests `CONNECT app.example.com:80` and `10.100.106.132:53` returns `A 192.168.220.25`
+- **WHEN** a client on port `8006` requests `CONNECT app.example.com:80` and `10.100.106.132:53` returns `A 192.168.220.25`
 - **THEN** the proxy translates the target address to `10.100.106.25:80` and dials `10.100.106.25:80`
 
 ### Requirement: Strict Per-Team DNS Failure Behavior
@@ -15,7 +15,7 @@ If Team `N`'s DNS server times out, returns an error (`SERVFAIL`, `REFUSED`, `NX
 
 #### Scenario: Team DNS server is down
 - **GIVEN** Team 3's DNS server at `10.100.103.132:53` is unreachable
-- **WHEN** a client on port `1083` requests `CONNECT app.example.com:443`
+- **WHEN** a client on port `8003` requests `CONNECT app.example.com:443`
 - **THEN** the proxy rejects the connection with `REP = 0x04 (Host unreachable)` without querying any other team's DNS server
 
 ### Requirement: Literal IPv4 Destination Translation
@@ -23,5 +23,5 @@ When a client sends an `IPv4` (`ATYP = 0x01`) `CONNECT` request on Team `N`'s pr
 
 #### Scenario: Web application redirects browser to literal internal IP
 - **GIVEN** Team 6 has external prefix `"10.100.106."` and `internal_mask` is `"192.168.220."`
-- **WHEN** a client on port `1086` requests `CONNECT 192.168.220.25:8080`
+- **WHEN** a client on port `8006` requests `CONNECT 192.168.220.25:8080`
 - **THEN** the proxy translates the destination to `10.100.106.25:8080` and dials `10.100.106.25:8080`
