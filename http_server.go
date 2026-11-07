@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -53,25 +54,6 @@ type FoxyProxyPattern struct {
 	Title   string `json:"title"`
 	Pattern string `json:"pattern"`
 	Active  bool   `json:"active"`
-}
-
-type HTTPHandlerOption func(*httpHandlerOptions)
-
-type httpHandlerOptions struct {
-	socksServer *Socks5Server
-	configPath  string
-}
-
-func WithSocksServer(srv *Socks5Server) HTTPHandlerOption {
-	return func(o *httpHandlerOptions) {
-		o.socksServer = srv
-	}
-}
-
-func WithConfigPath(path string) HTTPHandlerOption {
-	return func(o *httpHandlerOptions) {
-		o.configPath = path
-	}
 }
 
 type statusTeamRow struct {
@@ -165,12 +147,7 @@ curl -x socks5h://{{.ProxyHost}}:{{.BasePort}} http://{{.ExampleHost}}/</pre>
 </html>
 `))
 
-func NewHTTPHandler(resolver *Resolver, opts ...HTTPHandlerOption) http.Handler {
-	var options httpHandlerOptions
-	for _, opt := range opts {
-		opt(&options)
-	}
-
+func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath string) http.Handler {
 	var configMu sync.Mutex
 	mux := http.NewServeMux()
 
@@ -255,8 +232,42 @@ func NewHTTPHandler(resolver *Resolver, opts ...HTTPHandlerOption) http.Handler 
 		configMu.Lock()
 		defer configMu.Unlock()
 
-		merged := resolver.ConfigSnapshot()
-		if err := json.NewDecoder(r.Body).Decode(&merged); err != nil {
+		currentCfg := resolver.ConfigSnapshot()
+		if currentCfg.ConfigToken != "" {
+			wantAuth := "Bearer " + currentCfg.ConfigToken
+			gotAuth := strings.TrimSpace(r.Header.Get("Authorization"))
+			if subtle.ConstantTimeCompare([]byte(gotAuth), []byte(wantAuth)) != 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"status": "error",
+					"error":  "unauthorized",
+				})
+				return
+			}
+		}
+
+		secFetch := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+		if r.Header.Get("Origin") != "" || (secFetch != "" && secFetch != "same-origin" && secFetch != "none") {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "cross-origin requests are not allowed",
+			})
+			return
+		}
+		if ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))); ct != "" && !strings.HasPrefix(ct, "application/json") {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "Content-Type must be application/json",
+			})
+			return
+		}
+
+		var update ConfigUpdate
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&update); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "error",
@@ -264,6 +275,7 @@ func NewHTTPHandler(resolver *Resolver, opts ...HTTPHandlerOption) http.Handler 
 			})
 			return
 		}
+		merged := currentCfg.ApplyUpdate(update)
 		if err := merged.Validate(); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -272,8 +284,8 @@ func NewHTTPHandler(resolver *Resolver, opts ...HTTPHandlerOption) http.Handler 
 			})
 			return
 		}
-		if options.socksServer != nil {
-			if err := options.socksServer.Reconcile(merged); err != nil {
+		if socksServer != nil {
+			if err := socksServer.Reconcile(merged); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				_ = json.NewEncoder(w).Encode(map[string]string{
 					"status": "error",
@@ -281,11 +293,12 @@ func NewHTTPHandler(resolver *Resolver, opts ...HTTPHandlerOption) http.Handler 
 				})
 				return
 			}
+		} else {
+			resolver.UpdateConfig(merged)
 		}
-		resolver.UpdateConfig(merged)
-		if options.configPath != "" {
-			if err := SaveConfig(options.configPath, merged); err != nil {
-				slog.Warn("Failed to persist updated config to disk", "path", options.configPath, "err", err)
+		if configPath != "" {
+			if err := SaveConfig(configPath, merged); err != nil {
+				slog.Warn("Failed to persist updated config to disk", "path", configPath, "err", err)
 			}
 		}
 		slog.Info("Updated configuration via HTTP",
@@ -403,10 +416,7 @@ func BuildFoxyProxyConfig(cfg Config, proxyHost string) FoxyProxyExport {
 	}
 }
 
-// buildFoxyProxyPassthrough constructs a FoxyProxy v8 global passthrough rule that bypasses
-// the proxy (sending traffic DIRECT) for any URL whose host does not match the team domain,
-// internal subnet mask, or external subnet prefix. This allows users to select a specific
-// "Team XX" proxy in the FoxyProxy toolbar without breaking general internet browsing.
+// buildFoxyProxyPassthrough returns a FoxyProxy v8 global passthrough pattern that bypasses the proxy for non-team hosts.
 func buildFoxyProxyPassthrough(cfg Config) string {
 	var allowed []string
 	if cfg.TeamDomainName != "" {

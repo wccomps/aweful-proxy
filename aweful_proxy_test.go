@@ -69,6 +69,7 @@ func TestInvalidConfigsRejected(t *testing.T) {
 		{"missing xx in external_mask", func(c *Config) { c.ExternalMask = "10.100.100." }},
 		{"bad internal_mask", func(c *Config) { c.InternalMask = "192.168.220" }},
 		{"bad dns octet", func(c *Config) { c.TeamDNSServerLastOctet = -1 }},
+		{"http port collides with socks range", func(c *Config) { c.NumberOfTeams = 80 }},
 	}
 
 	for _, tc := range cases {
@@ -255,6 +256,30 @@ func TestResolverPerTeamDNSAndSecurity(t *testing.T) {
 	}
 }
 
+func startTestSocks5Server(t *testing.T, ctx context.Context, cfg Config) (*Resolver, *Socks5Server, int) {
+	t.Helper()
+	for attempt := 0; attempt < 10; attempt++ {
+		probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to probe free port: %v", err)
+		}
+		basePort := probeLn.Addr().(*net.TCPAddr).Port
+		_ = probeLn.Close()
+
+		cfg.BaseSocksPort = basePort
+		if err := cfg.Validate(); err != nil {
+			continue
+		}
+		resolver := NewResolver(cfg)
+		srv := NewSocks5Server(resolver)
+		if err := srv.Start(ctx); err == nil {
+			return resolver, srv, basePort
+		}
+	}
+	t.Fatal("failed to start SOCKS5 server after retries")
+	return nil, nil, 0
+}
+
 func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 	upstreamLn, err := net.Listen("tcp", "127.101.0.25:0")
 	if err != nil {
@@ -319,31 +344,7 @@ func TestSocks5EndToEndPerTeamAndMultiplexed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var (
-		srv      *Socks5Server
-		basePort int
-	)
-	for attempt := 0; attempt < 10; attempt++ {
-		probeLn, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("failed to probe free port: %v", err)
-		}
-		basePort = probeLn.Addr().(*net.TCPAddr).Port
-		_ = probeLn.Close()
-
-		cfg.BaseSocksPort = basePort
-		if err := cfg.Validate(); err != nil {
-			continue
-		}
-		resolver := NewResolver(cfg)
-		srv = NewSocks5Server(cfg, resolver)
-		if err := srv.Start(ctx); err == nil {
-			break
-		}
-	}
-	if srv == nil {
-		t.Fatal("failed to start SOCKS5 server after retries")
-	}
+	_, srv, basePort := startTestSocks5Server(t, ctx, cfg)
 	defer srv.Close()
 
 	t.Run("dedicated team port with domainname", func(t *testing.T) {
@@ -520,7 +521,7 @@ func TestHTTPManagementEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := NewHTTPHandler(NewResolver(cfg))
+	handler := NewHTTPHandler(NewResolver(cfg), nil, "")
 
 	reqHealth := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:8080/healthz", nil)
 	recHealth := httptest.NewRecorder()
@@ -602,43 +603,16 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var (
-		resolver *Resolver
-		srv      *Socks5Server
-		basePort int
-	)
-	for attempt := 0; attempt < 10; attempt++ {
-		probeLn, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("failed to probe free port: %v", err)
-		}
-		basePort = probeLn.Addr().(*net.TCPAddr).Port
-		_ = probeLn.Close()
-
-		cfg.BaseSocksPort = basePort
-		if err := cfg.Validate(); err != nil {
-			continue
-		}
-		resolver = NewResolver(cfg)
-		srv = NewSocks5Server(cfg, resolver)
-		if err := srv.Start(ctx); err == nil {
-			break
-		}
-	}
-	if srv == nil {
-		t.Fatal("failed to start SOCKS5 server")
-	}
+	resolver, srv, basePort := startTestSocks5Server(t, ctx, cfg)
 	defer srv.Close()
 
-	handler := NewHTTPHandler(resolver, WithSocksServer(srv), WithConfigPath(cfgPath))
+	handler := NewHTTPHandler(resolver, srv, cfgPath)
 
-	// Initially Team 2 port (basePort+2) should not be listening.
 	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+2), 100*time.Millisecond); err == nil {
 		_ = c.Close()
 		t.Fatalf("expected port %d not to be listening before POST /config", basePort+2)
 	}
 
-	// Push updated config with 2 teams and updated domain/DNS octet.
 	updateBody := `{
 		"number_of_teams": 2,
 		"external_mask": "127.1xx.0.",
@@ -647,20 +621,19 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 		"team_domain_name": "updated.example"
 	}`
 	reqPost := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(updateBody))
+	reqPost.Header.Set("Content-Type", "application/json")
 	recPost := httptest.NewRecorder()
 	handler.ServeHTTP(recPost, reqPost)
 	if recPost.Code != http.StatusOK {
 		t.Fatalf("expected 200 from POST /config, got %d: %s", recPost.Code, recPost.Body.String())
 	}
 
-	// Team 2 port (basePort+2) should now be listening.
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+2), 500*time.Millisecond)
 	if err != nil {
 		t.Fatalf("expected port %d to be listening after POST /config: %v", basePort+2, err)
 	}
 	_ = c.Close()
 
-	// Persisted config on disk should match the update.
 	savedCfg, err := LoadConfig(cfgPath)
 	if err != nil {
 		t.Fatalf("LoadConfig(cfgPath) failed: %v", err)
@@ -669,8 +642,8 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 		t.Fatalf("unexpected savedCfg: %+v", savedCfg)
 	}
 
-	// Invalid POST /config should return 400 and leave current config intact.
 	reqBad := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 0}`))
+	reqBad.Header.Set("Content-Type", "application/json")
 	recBad := httptest.NewRecorder()
 	handler.ServeHTTP(recBad, reqBad)
 	if recBad.Code != http.StatusBadRequest {
@@ -678,5 +651,14 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 	}
 	if resolver.ConfigSnapshot().NumberOfTeams != 2 {
 		t.Fatalf("expected NumberOfTeams to remain 2 after rejected POST /config")
+	}
+
+	reqCrossOrigin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 1}`))
+	reqCrossOrigin.Header.Set("Content-Type", "application/json")
+	reqCrossOrigin.Header.Set("Origin", "https://evil.example")
+	recCrossOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recCrossOrigin, reqCrossOrigin)
+	if recCrossOrigin.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin POST /config, got %d", recCrossOrigin.Code)
 	}
 }

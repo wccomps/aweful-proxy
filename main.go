@@ -34,7 +34,7 @@ func main() {
 	defer stop()
 
 	resolver := NewResolver(cfg)
-	socksServer := NewSocks5Server(cfg, resolver)
+	socksServer := NewSocks5Server(resolver)
 	if err := socksServer.Start(ctx); err != nil {
 		slog.Error("Failed to start SOCKS5 listeners", "err", err)
 		os.Exit(1)
@@ -50,7 +50,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPListenAddr,
-		Handler:           NewHTTPHandler(resolver, WithSocksServer(socksServer), WithConfigPath(*configPath)),
+		Handler:           NewHTTPHandler(resolver, socksServer, *configPath),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

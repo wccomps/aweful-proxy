@@ -51,6 +51,34 @@ type Config struct {
 	DNSTimeoutMs           int           `json:"dns_timeout_ms"`
 	DialTimeoutMs          int           `json:"dial_timeout_ms"`
 	IdleTimeoutSec         int           `json:"idle_timeout_sec"`
+	ConfigToken            string        `json:"-"`
+}
+
+type ConfigUpdate struct {
+	NumberOfTeams          *int           `json:"number_of_teams"`
+	InternalMask           *string        `json:"internal_mask"`
+	ExternalMask           *string        `json:"external_mask"`
+	TeamDNSServerLastOctet *FlexibleOctet `json:"team_dns_server_last_octet"`
+	TeamDomainName         *string        `json:"team_domain_name"`
+}
+
+func (c Config) ApplyUpdate(u ConfigUpdate) Config {
+	if u.NumberOfTeams != nil {
+		c.NumberOfTeams = *u.NumberOfTeams
+	}
+	if u.InternalMask != nil {
+		c.InternalMask = *u.InternalMask
+	}
+	if u.ExternalMask != nil {
+		c.ExternalMask = *u.ExternalMask
+	}
+	if u.TeamDNSServerLastOctet != nil {
+		c.TeamDNSServerLastOctet = *u.TeamDNSServerLastOctet
+	}
+	if u.TeamDomainName != nil {
+		c.TeamDomainName = *u.TeamDomainName
+	}
+	return c
 }
 
 func DefaultConfig() Config {
@@ -118,6 +146,7 @@ func applyEnvOverrides(cfg *Config) error {
 		{"AWEFUL_PROXY_SOCKS_LISTEN_HOST", &cfg.SocksListenHost},
 		{"AWEFUL_PROXY_HTTP_LISTEN_ADDR", &cfg.HTTPListenAddr},
 		{"AWEFUL_PROXY_ADVERTISE_HOST", &cfg.ProxyAdvertiseHost},
+		{"AWEFUL_PROXY_CONFIG_TOKEN", &cfg.ConfigToken},
 	}
 	for _, b := range strBindings {
 		if v := os.Getenv(b.env); v != "" {
@@ -184,13 +213,23 @@ func (c *Config) Validate() error {
 	}
 	dnsOctet := int(c.TeamDNSServerLastOctet)
 	if dnsOctet < 0 || dnsOctet > 254 {
-		return fmt.Errorf("team_dns_server_last_octet must be between 0 (auto) and 254 (got %d)", dnsOctet)
+		return fmt.Errorf("team_dns_server_last_octet must be between 0 and 254 (got %d)", dnsOctet)
 	}
 	if c.TeamDNSServerPort < 1 || c.TeamDNSServerPort > 65535 {
 		return fmt.Errorf("team_dns_server_port must be between 1 and 65535 (got %d)", c.TeamDNSServerPort)
 	}
 	if c.BaseSocksPort < 1 || c.BaseSocksPort+c.NumberOfTeams > 65535 {
 		return fmt.Errorf("base_socks_port (%d) + number_of_teams (%d) must be within valid TCP port range 1..65535", c.BaseSocksPort, c.NumberOfTeams)
+	}
+	if _, portStr, err := net.SplitHostPort(c.HTTPListenAddr); err == nil {
+		if httpPort, err := strconv.Atoi(portStr); err == nil {
+			if httpPort >= c.BaseSocksPort && httpPort <= c.BaseSocksPort+c.NumberOfTeams {
+				return fmt.Errorf("http_listen_addr port (%d) collides with SOCKS5 port range %d..%d", httpPort, c.BaseSocksPort, c.BaseSocksPort+c.NumberOfTeams)
+			}
+		}
+	}
+	if c.ProxyAdvertiseHost != "" && !isValidHostOrIP(c.ProxyAdvertiseHost) {
+		return fmt.Errorf("invalid proxy_advertise_host %q", c.ProxyAdvertiseHost)
 	}
 	if c.DNSTimeoutMs <= 0 {
 		return fmt.Errorf("dns_timeout_ms must be positive (got %d)", c.DNSTimeoutMs)

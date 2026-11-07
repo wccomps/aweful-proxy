@@ -74,7 +74,7 @@ type Socks5Server struct {
 	wg          sync.WaitGroup
 }
 
-func NewSocks5Server(_ Config, resolver *Resolver) *Socks5Server {
+func NewSocks5Server(resolver *Resolver) *Socks5Server {
 	return &Socks5Server{
 		resolver:    resolver,
 		listeners:   make(map[int]teamListener),
@@ -101,44 +101,42 @@ func (s *Socks5Server) Reconcile(cfg Config) error {
 		ctx = context.Background()
 	}
 
-	for team, tl := range s.listeners {
-		if team <= cfg.NumberOfTeams {
-			wantAddr := net.JoinHostPort(cfg.SocksListenHost, strconv.Itoa(cfg.BaseSocksPort+team))
-			if tl.addr == wantAddr {
-				continue
-			}
-		}
-		_ = tl.ln.Close()
-		delete(s.listeners, team)
-	}
-
-	var newlyOpened []int
+	newlyOpened := make(map[int]teamListener)
 	for team := 0; team <= cfg.NumberOfTeams; team++ {
-		if _, exists := s.listeners[team]; exists {
+		port := cfg.BaseSocksPort + team
+		wantAddr := net.JoinHostPort(cfg.SocksListenHost, strconv.Itoa(port))
+		if existing, exists := s.listeners[team]; exists && existing.addr == wantAddr {
 			continue
 		}
-		port := cfg.BaseSocksPort + team
-		addr := net.JoinHostPort(cfg.SocksListenHost, strconv.Itoa(port))
-		ln, err := net.Listen("tcp", addr)
+		ln, err := net.Listen("tcp", wantAddr)
 		if err != nil {
-			for _, t := range newlyOpened {
-				_ = s.listeners[t].ln.Close()
-				delete(s.listeners, t)
+			for _, tl := range newlyOpened {
+				_ = tl.ln.Close()
 			}
 			return fmt.Errorf("listening on SOCKS5 port %d (team %d): %w", port, team, err)
 		}
-		s.listeners[team] = teamListener{addr: addr, ln: ln}
-		newlyOpened = append(newlyOpened, team)
+		newlyOpened[team] = teamListener{addr: wantAddr, ln: ln}
 	}
 
-	for _, team := range newlyOpened {
-		ln := s.listeners[team].ln
+	for team, tl := range s.listeners {
+		if _, replaced := newlyOpened[team]; replaced || team > cfg.NumberOfTeams {
+			_ = tl.ln.Close()
+			delete(s.listeners, team)
+		}
+	}
+	for team, tl := range newlyOpened {
+		s.listeners[team] = tl
+	}
+
+	s.resolver.UpdateConfig(cfg)
+
+	for team, tl := range newlyOpened {
 		fixedTeam := team
 		s.wg.Add(1)
 		go func(l net.Listener, t int) {
 			defer s.wg.Done()
 			s.acceptLoop(ctx, l, t)
-		}(ln, fixedTeam)
+		}(tl.ln, fixedTeam)
 	}
 	return nil
 }
