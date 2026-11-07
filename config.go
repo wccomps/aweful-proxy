@@ -52,6 +52,16 @@ type Config struct {
 	DialTimeoutMs          int           `json:"dial_timeout_ms"`
 	IdleTimeoutSec         int           `json:"idle_timeout_sec"`
 	ConfigToken            string        `json:"-"`
+	RequireSSO             bool          `json:"require_sso,omitempty"`
+	OIDCIssuerURL          string        `json:"oidc_issuer_url,omitempty"`
+	OIDCClientID           string        `json:"oidc_client_id,omitempty"`
+	OIDCClientSecret       string        `json:"-"`
+	SessionSecret          string        `json:"-"`
+	SessionTTLSec          int           `json:"session_ttl_sec,omitempty"`
+	TrustForwardAuth       bool          `json:"trust_forward_auth,omitempty"`
+	TrustedProxyCIDRs      []string      `json:"trusted_proxy_cidrs,omitempty"`
+	AllowedGroups          []string      `json:"allowed_groups,omitempty"`
+	AllowedClientCIDRs     []string      `json:"allowed_client_cidrs,omitempty"`
 }
 
 type ConfigUpdate struct {
@@ -90,6 +100,7 @@ func DefaultConfig() Config {
 		DNSTimeoutMs:      2000,
 		DialTimeoutMs:     5000,
 		IdleTimeoutSec:    300,
+		SessionTTLSec:     43200,
 	}
 }
 
@@ -147,10 +158,51 @@ func applyEnvOverrides(cfg *Config) error {
 		{"AWEFUL_PROXY_HTTP_LISTEN_ADDR", &cfg.HTTPListenAddr},
 		{"AWEFUL_PROXY_ADVERTISE_HOST", &cfg.ProxyAdvertiseHost},
 		{"AWEFUL_PROXY_CONFIG_TOKEN", &cfg.ConfigToken},
+		{"AWEFUL_PROXY_OIDC_ISSUER_URL", &cfg.OIDCIssuerURL},
+		{"AWEFUL_PROXY_OIDC_CLIENT_ID", &cfg.OIDCClientID},
+		{"AWEFUL_PROXY_OIDC_CLIENT_SECRET", &cfg.OIDCClientSecret},
+		{"AWEFUL_PROXY_SESSION_SECRET", &cfg.SessionSecret},
 	}
 	for _, b := range strBindings {
 		if v := os.Getenv(b.env); v != "" {
 			*b.target = v
+		}
+	}
+
+	boolBindings := []struct {
+		env    string
+		target *bool
+	}{
+		{"AWEFUL_PROXY_REQUIRE_SSO", &cfg.RequireSSO},
+		{"AWEFUL_PROXY_TRUST_FORWARD_AUTH", &cfg.TrustForwardAuth},
+	}
+	for _, b := range boolBindings {
+		if v := strings.TrimSpace(os.Getenv(b.env)); v != "" {
+			parsed, err := strconv.ParseBool(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s: %w", b.env, err)
+			}
+			*b.target = parsed
+		}
+	}
+
+	csvBindings := []struct {
+		env    string
+		target *[]string
+	}{
+		{"AWEFUL_PROXY_TRUSTED_PROXY_CIDRS", &cfg.TrustedProxyCIDRs},
+		{"AWEFUL_PROXY_ALLOWED_GROUPS", &cfg.AllowedGroups},
+		{"AWEFUL_PROXY_ALLOWED_CLIENT_CIDRS", &cfg.AllowedClientCIDRs},
+	}
+	for _, b := range csvBindings {
+		if v := strings.TrimSpace(os.Getenv(b.env)); v != "" {
+			var items []string
+			for _, part := range strings.Split(v, ",") {
+				if trimmed := strings.TrimSpace(part); trimmed != "" {
+					items = append(items, trimmed)
+				}
+			}
+			*b.target = items
 		}
 	}
 
@@ -165,6 +217,7 @@ func applyEnvOverrides(cfg *Config) error {
 		{"AWEFUL_PROXY_DNS_TIMEOUT_MS", &cfg.DNSTimeoutMs},
 		{"AWEFUL_PROXY_DIAL_TIMEOUT_MS", &cfg.DialTimeoutMs},
 		{"AWEFUL_PROXY_IDLE_TIMEOUT_SEC", &cfg.IdleTimeoutSec},
+		{"AWEFUL_PROXY_SESSION_TTL_SEC", &cfg.SessionTTLSec},
 	}
 	for _, b := range intBindings {
 		if v := os.Getenv(b.env); v != "" {
@@ -192,6 +245,9 @@ func (c *Config) normalize() {
 	if c.TeamDNSServerPort == 0 {
 		c.TeamDNSServerPort = 53
 	}
+	if c.SessionTTLSec <= 0 {
+		c.SessionTTLSec = int(defaultSessionTTL.Seconds())
+	}
 }
 
 func (c *Config) Validate() error {
@@ -209,6 +265,9 @@ func (c *Config) Validate() error {
 		prefix := c.TeamExternalPrefix(team)
 		if !isValidThreeOctetPrefix(prefix) {
 			return fmt.Errorf("external_mask %q produced invalid IPv4 prefix %q for team %d", c.ExternalMask, prefix, team)
+		}
+		if overlapsLocalInterfaceSubnet(net.ParseIP(prefix+"1"), true) {
+			return fmt.Errorf("external_mask %q overlaps a local host network interface (%s0/24)", c.ExternalMask, prefix)
 		}
 	}
 	dnsOctet := int(c.TeamDNSServerLastOctet)
@@ -276,4 +335,11 @@ func (c Config) DialTimeout() time.Duration {
 
 func (c Config) IdleTimeout() time.Duration {
 	return time.Duration(c.IdleTimeoutSec) * time.Second
+}
+
+func (c Config) SessionTTL() time.Duration {
+	if c.SessionTTLSec <= 0 {
+		return defaultSessionTTL
+	}
+	return time.Duration(c.SessionTTLSec) * time.Second
 }

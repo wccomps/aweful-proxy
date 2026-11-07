@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,9 @@ type statusPageData struct {
 	MaxPort        int
 	ExamplePort    int
 	ExampleHost    string
+	AuthUser       string
+	ClientIP       string
+	SocksToken     string
 	Teams          []statusTeamRow
 }
 
@@ -97,6 +101,9 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!DOCTYPE html>
 </head>
 <body>
 <h1>aweful-proxy</h1>
+{{if .AuthUser}}
+<p>Signed in via Authentik SSO as <code>{{.AuthUser}}</code> (SOCKS5 access authorized for <code>{{.ClientIP}}</code>). <a href="/auth/logout">Sign out</a></p>
+{{end}}
 
 <h2>Active Configuration</h2>
 <table>
@@ -119,8 +126,13 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!DOCTYPE html>
 </ol>
 
 <h2>CLI Usage</h2>
+{{if .SocksToken}}
+<pre>curl -x socks5h://{{.ProxyHost}}:{{.ExamplePort}} -U {{.AuthUser}}:{{.SocksToken}} http://{{.ExampleHost}}/
+curl -x socks5h://{{.ProxyHost}}:{{.BasePort}} -U team01+{{.AuthUser}}:{{.SocksToken}} http://{{.ExampleHost}}/</pre>
+{{else}}
 <pre>curl -x socks5h://{{.ProxyHost}}:{{.ExamplePort}} http://{{.ExampleHost}}/
 curl -x socks5h://{{.ProxyHost}}:{{.BasePort}} http://{{.ExampleHost}}/</pre>
+{{end}}
 
 <h2>Per-Team SOCKS5 Ports</h2>
 <table>
@@ -150,6 +162,40 @@ curl -x socks5h://{{.ProxyHost}}:{{.BasePort}} http://{{.ExampleHost}}/</pre>
 func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath string) http.Handler {
 	var configMu sync.Mutex
 	mux := http.NewServeMux()
+	auth := NewAuthenticator(resolver.ConfigSnapshot().SessionSecret)
+	if socksServer != nil {
+		socksServer.SetAuthenticator(auth)
+	}
+
+	requireStaffAuth := func(cfg Config, w http.ResponseWriter, r *http.Request) (*AuthIdentity, bool) {
+		if !auth.Enabled(cfg) {
+			return nil, true
+		}
+		id, err := auth.AuthenticateRequest(cfg, r)
+		if err == nil {
+			return id, true
+		}
+		if strings.Contains(err.Error(), "authorized staff group") {
+			http.Error(w, "Forbidden: your Authentik account is not in an authorized staff group", http.StatusForbidden)
+			return nil, false
+		}
+		if cfg.OIDCClientID != "" && r.Method == http.MethodGet {
+			http.Redirect(w, r, "/auth/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+			return nil, false
+		}
+		http.Error(w, "Unauthorized: Authentik SSO login required", http.StatusUnauthorized)
+		return nil, false
+	}
+
+	mux.HandleFunc("GET /auth/login", func(w http.ResponseWriter, r *http.Request) {
+		auth.HandleLogin(resolver.ConfigSnapshot(), w, r)
+	})
+	mux.HandleFunc("GET /auth/callback", func(w http.ResponseWriter, r *http.Request) {
+		auth.HandleCallback(resolver.ConfigSnapshot(), w, r)
+	})
+	mux.HandleFunc("GET /auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		auth.HandleLogout(resolver.ConfigSnapshot(), w, r)
+	})
 
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -157,6 +203,10 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 			return
 		}
 		cfg := resolver.ConfigSnapshot()
+		id, ok := requireStaffAuth(cfg, w, r)
+		if !ok {
+			return
+		}
 		proxyHost := resolveAdvertiseHost(cfg, r)
 		domainLabel := cfg.TeamDomainName
 		if domainLabel == "" {
@@ -200,6 +250,11 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 			ExampleHost:    exampleHost,
 			Teams:          rows,
 		}
+		if id != nil {
+			data.AuthUser = id.Username
+			data.ClientIP = ClientIPFromRequest(cfg, r)
+			data.SocksToken = auth.IssueSocksToken(*id)
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_ = statusPageTmpl.Execute(w, data)
 	})
@@ -221,6 +276,9 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 
 	mux.HandleFunc("GET /config", func(w http.ResponseWriter, r *http.Request) {
 		cfg := resolver.ConfigSnapshot()
+		if _, ok := requireStaffAuth(cfg, w, r); !ok {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(cfg)
 	})
@@ -233,17 +291,23 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 		defer configMu.Unlock()
 
 		currentCfg := resolver.ConfigSnapshot()
-		if currentCfg.ConfigToken != "" {
-			wantAuth := "Bearer " + currentCfg.ConfigToken
-			gotAuth := strings.TrimSpace(r.Header.Get("Authorization"))
-			if subtle.ConstantTimeCompare([]byte(gotAuth), []byte(wantAuth)) != 1 {
-				w.WriteHeader(http.StatusUnauthorized)
-				_ = json.NewEncoder(w).Encode(map[string]string{
-					"status": "error",
-					"error":  "unauthorized",
-				})
-				return
-			}
+		if currentCfg.ConfigToken == "" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "POST /config is disabled unless AWEFUL_PROXY_CONFIG_TOKEN is configured",
+			})
+			return
+		}
+		wantAuth := "Bearer " + currentCfg.ConfigToken
+		gotAuth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if subtle.ConstantTimeCompare([]byte(gotAuth), []byte(wantAuth)) != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "unauthorized",
+			})
+			return
 		}
 
 		secFetch := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
@@ -321,6 +385,9 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 
 	mux.HandleFunc("GET /foxyproxy.json", func(w http.ResponseWriter, r *http.Request) {
 		cfg := resolver.ConfigSnapshot()
+		if _, ok := requireStaffAuth(cfg, w, r); !ok {
+			return
+		}
 		if qTeams := strings.TrimSpace(r.URL.Query().Get("teams")); qTeams != "" {
 			if n, err := strconv.Atoi(qTeams); err == nil && n >= 1 && n <= cfg.NumberOfTeams {
 				cfg.NumberOfTeams = n
@@ -336,7 +403,14 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 		_ = enc.Encode(export)
 	})
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := resolver.ConfigSnapshot()
+		if !IsClientAllowed(cfg, ClientIPFromRequest(cfg, r)) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func resolveAdvertiseHost(cfg Config, r *http.Request) string {

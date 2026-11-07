@@ -155,6 +155,9 @@ func (r *Resolver) TranslateAndValidateIPv4(team int, rawIP string) (string, err
 	if err != nil || octet < 1 || octet > 254 {
 		return "", ErrDestinationNotAllowed
 	}
+	if overlapsLocalInterfaceSubnet(net.ParseIP(ipStr), true) {
+		return "", ErrDestinationNotAllowed
+	}
 	return ipStr, nil
 }
 

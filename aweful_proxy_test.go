@@ -608,6 +608,26 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 
 	handler := NewHTTPHandler(resolver, srv, cfgPath)
 
+	reqNoToken := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 2}`))
+	reqNoToken.Header.Set("Content-Type", "application/json")
+	recNoToken := httptest.NewRecorder()
+	handler.ServeHTTP(recNoToken, reqNoToken)
+	if recNoToken.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when ConfigToken is empty, got %d", recNoToken.Code)
+	}
+
+	cfg = resolver.ConfigSnapshot()
+	cfg.ConfigToken = "test-secret-token"
+	resolver.UpdateConfig(cfg)
+
+	reqUnauth := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 2}`))
+	reqUnauth.Header.Set("Content-Type", "application/json")
+	recUnauth := httptest.NewRecorder()
+	handler.ServeHTTP(recUnauth, reqUnauth)
+	if recUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when Authorization header is missing, got %d", recUnauth.Code)
+	}
+
 	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+2), 100*time.Millisecond); err == nil {
 		_ = c.Close()
 		t.Fatalf("expected port %d not to be listening before POST /config", basePort+2)
@@ -622,6 +642,7 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 	}`
 	reqPost := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(updateBody))
 	reqPost.Header.Set("Content-Type", "application/json")
+	reqPost.Header.Set("Authorization", "Bearer test-secret-token")
 	recPost := httptest.NewRecorder()
 	handler.ServeHTTP(recPost, reqPost)
 	if recPost.Code != http.StatusOK {
@@ -644,6 +665,7 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 
 	reqBad := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 0}`))
 	reqBad.Header.Set("Content-Type", "application/json")
+	reqBad.Header.Set("Authorization", "Bearer test-secret-token")
 	recBad := httptest.NewRecorder()
 	handler.ServeHTTP(recBad, reqBad)
 	if recBad.Code != http.StatusBadRequest {
@@ -655,6 +677,7 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 
 	reqLoopback := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"external_mask": "127.1xx.0."}`))
 	reqLoopback.Header.Set("Content-Type", "application/json")
+	reqLoopback.Header.Set("Authorization", "Bearer test-secret-token")
 	recLoopback := httptest.NewRecorder()
 	handler.ServeHTTP(recLoopback, reqLoopback)
 	if recLoopback.Code != http.StatusBadRequest {
@@ -663,10 +686,143 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 
 	reqCrossOrigin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/config", strings.NewReader(`{"number_of_teams": 1}`))
 	reqCrossOrigin.Header.Set("Content-Type", "application/json")
+	reqCrossOrigin.Header.Set("Authorization", "Bearer test-secret-token")
 	reqCrossOrigin.Header.Set("Origin", "https://evil.example")
 	recCrossOrigin := httptest.NewRecorder()
 	handler.ServeHTTP(recCrossOrigin, reqCrossOrigin)
 	if recCrossOrigin.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for cross-origin POST /config, got %d", recCrossOrigin.Code)
+	}
+}
+
+func TestAuthentikSSOForwardAuthAndSocks5LeaseAndToken(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumberOfTeams = 2
+	cfg.InternalMask = "192.168.220."
+	cfg.ExternalMask = "10.100.1xx."
+	cfg.TeamDNSServerLastOctet = 10
+	cfg.TeamDomainName = "example.com"
+	cfg.SocksListenHost = "127.0.0.1"
+	cfg.RequireSSO = true
+	cfg.TrustForwardAuth = true
+	cfg.SessionSecret = "test-session-secret"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resolver, srv, basePort := startTestSocks5Server(t, ctx, cfg)
+	defer srv.Close()
+
+	handler := NewHTTPHandler(resolver, srv, "")
+
+	reqUnauth := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
+	reqUnauth.RemoteAddr = "127.0.0.1:50000"
+	recUnauth := httptest.NewRecorder()
+	handler.ServeHTTP(recUnauth, reqUnauth)
+	if recUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated GET /, got %d", recUnauth.Code)
+	}
+
+	reqBlue := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
+	reqBlue.RemoteAddr = "127.0.0.1:50000"
+	reqBlue.Header.Set("X-authentik-username", "team01")
+	reqBlue.Header.Set("X-authentik-groups", "WCComps_BlueTeam|WCComps_Team01")
+	recBlue := httptest.NewRecorder()
+	handler.ServeHTTP(recBlue, reqBlue)
+	if recBlue.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for Blue Team user on GET /, got %d", recBlue.Code)
+	}
+
+	connUnauth, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = connUnauth.Write([]byte{0x05, 0x01, 0x00})
+	respUnauth := make([]byte, 2)
+	_, _ = io.ReadFull(connUnauth, respUnauth)
+	_ = connUnauth.Close()
+	if respUnauth[1] != methodNoAcceptable {
+		t.Fatalf("expected SOCKS5 methodNoAcceptable (0xFF) before SSO login, got 0x%02x", respUnauth[1])
+	}
+
+	reqStaff := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
+	reqStaff.RemoteAddr = "127.0.0.1:50000"
+	reqStaff.Header.Set("X-authentik-username", "alice")
+	reqStaff.Header.Set("X-authentik-groups", "WCComps_OrangeTeam")
+	recStaff := httptest.NewRecorder()
+	handler.ServeHTTP(recStaff, reqStaff)
+	if recStaff.Code != http.StatusOK {
+		t.Fatalf("expected 200 for Orange Team user on GET /, got %d", recStaff.Code)
+	}
+	if !strings.Contains(recStaff.Body.String(), "Signed in via Authentik SSO as <code>alice</code>") {
+		t.Fatalf("expected status page to display signed-in user alice")
+	}
+
+	connLeased, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = connLeased.Write([]byte{0x05, 0x01, 0x00})
+	respLeased := make([]byte, 2)
+	_, _ = io.ReadFull(connLeased, respLeased)
+	_ = connLeased.Close()
+	if respLeased[1] != methodNoAuth {
+		t.Fatalf("expected SOCKS5 methodNoAuth (0x00) after SSO login granted IP lease, got 0x%02x", respLeased[1])
+	}
+
+	reqLogout := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/auth/logout", nil)
+	reqLogout.RemoteAddr = "127.0.0.1:50000"
+	recLogout := httptest.NewRecorder()
+	handler.ServeHTTP(recLogout, reqLogout)
+	if recLogout.Code != http.StatusFound {
+		t.Fatalf("expected 302 from /auth/logout, got %d", recLogout.Code)
+	}
+
+	connAfterLogout, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = connAfterLogout.Write([]byte{0x05, 0x01, 0x00})
+	respAfterLogout := make([]byte, 2)
+	_, _ = io.ReadFull(connAfterLogout, respAfterLogout)
+	_ = connAfterLogout.Close()
+	if respAfterLogout[1] != methodNoAcceptable {
+		t.Fatalf("expected SOCKS5 methodNoAcceptable (0xFF) after /auth/logout, got 0x%02x", respAfterLogout[1])
+	}
+
+	auth := NewAuthenticator(cfg.SessionSecret)
+	token := auth.IssueSocksToken(AuthIdentity{
+		Username:  "alice",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+
+	connToken, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = connToken.Write([]byte{0x05, 0x01, 0x02})
+	respMethod := make([]byte, 2)
+	_, _ = io.ReadFull(connToken, respMethod)
+	if respMethod[1] != methodUserPass {
+		t.Fatalf("expected methodUserPass (0x02), got 0x%02x", respMethod[1])
+	}
+	authPacket := []byte{0x01, byte(len("alice"))}
+	authPacket = append(authPacket, []byte("alice")...)
+	authPacket = append(authPacket, byte(len(token)))
+	authPacket = append(authPacket, []byte(token)...)
+	_, _ = connToken.Write(authPacket)
+	respAuth := make([]byte, 2)
+	_, _ = io.ReadFull(connToken, respAuth)
+	_ = connToken.Close()
+	if respAuth[1] != 0x00 {
+		t.Fatalf("expected RFC 1929 token auth success (0x00), got 0x%02x", respAuth[1])
+	}
+
+	reqTeamIP := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/healthz", nil)
+	reqTeamIP.RemoteAddr = "10.100.101.25:44444"
+	recTeamIP := httptest.NewRecorder()
+	handler.ServeHTTP(recTeamIP, reqTeamIP)
+	if recTeamIP.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for request originating from Blue Team subnet, got %d", recTeamIP.Code)
 	}
 }
