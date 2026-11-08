@@ -108,6 +108,11 @@ func LoadConfig(path string) (Config, error) {
 	cfg := DefaultConfig()
 	if path != "" {
 		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			if seedPath := strings.TrimSpace(os.Getenv("AWEFUL_PROXY_SEED_CONFIG")); seedPath != "" && seedPath != path {
+				data, err = os.ReadFile(seedPath)
+			}
+		}
 		if err != nil {
 			if !errors.Is(err, os.ErrNotExist) || os.Getenv("AWEFUL_PROXY_NUMBER_OF_TEAMS") == "" {
 				return cfg, fmt.Errorf("reading config file %s: %w", path, err)
