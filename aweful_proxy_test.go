@@ -50,6 +50,15 @@ func TestLoadAndValidateConfig(t *testing.T) {
 	if got := cfg.TeamDNSServerAddr(6); got != "10.100.106.132:53" {
 		t.Fatalf("expected team 6 DNS server 10.100.106.132:53, got %q", got)
 	}
+
+	t.Setenv("AWEFUL_PROXY_SEED_CONFIG", cfgPath)
+	seededCfg, err := LoadConfig(filepath.Join(tmpDir, "missing-runtime-config.json"))
+	if err != nil {
+		t.Fatalf("LoadConfig with AWEFUL_PROXY_SEED_CONFIG failed: %v", err)
+	}
+	if seededCfg.NumberOfTeams != 20 || seededCfg.TeamDomainName != "example.com" {
+		t.Fatalf("unexpected seeded config: %+v", seededCfg)
+	}
 }
 
 func TestInvalidConfigsRejected(t *testing.T) {
