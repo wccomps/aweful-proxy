@@ -60,3 +60,15 @@ and configuration pinned, and preserve the active team DNS, masks and ports thro
 ```bash
 ./aweful-proxy -config config.json
 ```
+
+### Debug logging
+
+Debug logging surfaces per-request DNS and dial diagnostics (which team DNS server was queried, the resolved and translated IPs, and the SOCKS reply code on resolution/dial failures). Enable it with either the flag or the environment variable:
+
+```bash
+./aweful-proxy -config config.json -debug
+# or, without changing the command/args (e.g. in Kubernetes):
+AWEFUL_PROXY_DEBUG=true ./aweful-proxy -config config.json
+```
+
+`AWEFUL_PROXY_DEBUG` accepts `true`/`false` and `1`/`0`. The `-debug` flag and the env var are OR'd: either one enabling turns on debug logging.

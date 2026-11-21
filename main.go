@@ -8,17 +8,34 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
+// envDebugEnabled reports whether AWEFUL_PROXY_DEBUG requests debug logging.
+// Accepts the strconv.ParseBool set (true/false, 1/0, t/f, yes/no is not
+// included); an unset or unparseable value leaves debug off.
+func envDebugEnabled() bool {
+	v, ok := os.LookupEnv("AWEFUL_PROXY_DEBUG")
+	if !ok {
+		return false
+	}
+	enabled, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		return false
+	}
+	return enabled
+}
+
 func main() {
 	configPath := flag.String("config", "/etc/aweful-proxy/config.json", "Path to aweful-proxy JSON configuration file")
-	debug := flag.Bool("debug", false, "Enable debug logging")
+	debug := flag.Bool("debug", false, "Enable debug logging (also AWEFUL_PROXY_DEBUG=true/false/1/0)")
 	flag.Parse()
 
 	logLevel := slog.LevelInfo
-	if *debug {
+	if *debug || envDebugEnabled() {
 		logLevel = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
