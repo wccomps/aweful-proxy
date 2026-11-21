@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var teamBadgeColors = []string{
@@ -77,8 +78,8 @@ type statusPageData struct {
 	ExamplePort    int
 	ExampleHost    string
 	AuthUser       string
-	ClientIP       string
-	SocksToken     string
+	ForwardAuth    bool
+	MintSession    bool
 	Teams          []statusTeamRow
 }
 
@@ -103,7 +104,14 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!DOCTYPE html>
 <body>
 <h1>aweful-proxy</h1>
 {{if .AuthUser}}
-<form method="post" action="/auth/logout" style="margin: 0.5rem 0;">Signed in via Authentik SSO as <code>{{.AuthUser}}</code> (SOCKS5 access authorized for <code>{{.ClientIP}}</code>). <button type="submit">Sign out</button></form>
+<p>Signed in via Authentik SSO as <code>{{.AuthUser}}</code>.</p>
+{{if .MintSession}}
+<form method="post" action="/auth/socks"><button type="submit">Generate SOCKS5 credentials</button></form>
+<form method="post" action="/auth/socks/revoke"><button type="submit">Revoke SOCKS5 credentials</button></form>
+<form method="post" action="/auth/logout"><button type="submit">{{if .ForwardAuth}}End local SOCKS session{{else}}Sign out{{end}}</button></form>
+{{else}}
+<form method="post" action="/auth/socks/session"><button type="submit">Start local SOCKS session</button></form>
+{{end}}
 {{end}}
 
 <h2>Active Configuration</h2>
@@ -121,15 +129,18 @@ var statusPageTmpl = template.Must(template.New("status").Parse(`<!DOCTYPE html>
 <h2>Browser Setup (FoxyProxy)</h2>
 <p><a class="dl-link" href="/foxyproxy.json">Download foxyproxy-teams.json</a></p>
 <ol>
-  <li>Install the FoxyProxy extension in Firefox or Chrome, open <strong>Options &rarr; Import</strong>, and import <code>foxyproxy-teams.json</code>.</li>
-  <li>Click the FoxyProxy icon in the browser toolbar and select <strong>Team 01</strong> .. <strong>Team {{printf "%02d" .NumberOfTeams}}</strong> (or <strong>Team 00</strong> for the base template). Non-team URLs bypass the proxy automatically.</li>
-  <li>When switching between teams, use a Private/Incognito window or clear site data so cookies and sessions from one team are not reused on another team.</li>
+  <li>Use a dedicated Firefox profile with FoxyProxy Standard set to <strong>Run in Private Windows → Allow</strong>. Import <code>foxyproxy-teams.json</code> with <strong>Options → Import</strong> and save.</li>
+  {{if .AuthUser}}
+  <li>Generate credentials above. In FoxyProxy <strong>Proxies → Bulk Edit</strong>, enter the username in the last text box and choose <strong>Set → Username</strong>. Repeat with the password and <strong>Set → Password</strong>, then <strong>Save</strong>. This edits all presets in the profile. For Team 00, add <code>team00+</code> to that preset's username after bulk editing.</li>
+  <li>To renew, bulk-set the new password and save, then clear and reselect the team in each open check tab.</li>
+  {{end}}
+  <li>Leave global proxying disabled. In the check tab, choose <strong>More → Tab Proxy</strong>, select the team, and open or reload the service. <strong>Proxy by Patterns</strong> does not select teams by hostname.</li>
+  <li>Use separate Firefox containers or profiles if you sign into the same service on different teams; changing proxy ports does not isolate cookies.</li>
 </ol>
 
 <h2>CLI Usage</h2>
-{{if .SocksToken}}
-<pre>curl -x socks5h://{{.ProxyHost}}:{{.ExamplePort}} -U {{.AuthUser}}:{{.SocksToken}} http://{{.ExampleHost}}/
-curl -x socks5h://{{.ProxyHost}}:{{.BasePort}} -U team01+{{.AuthUser}}:{{.SocksToken}} http://{{.ExampleHost}}/</pre>
+{{if .AuthUser}}
+<pre>curl --proxy socks5h://{{.ProxyHost}}:{{.ExamplePort}} --proxy-user USERNAME:PASSWORD http://{{.ExampleHost}}/</pre>
 {{else}}
 <pre>curl -x socks5h://{{.ProxyHost}}:{{.ExamplePort}} http://{{.ExampleHost}}/
 curl -x socks5h://{{.ProxyHost}}:{{.BasePort}} http://{{.ExampleHost}}/</pre>
@@ -195,6 +206,62 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 		auth.HandleLogout(resolver.ConfigSnapshot(), w, r)
 	})
 
+	// All credential mutations require a staff identity and a same-origin form POST.
+	socksCredentialPost := func(next func(Config, http.ResponseWriter, *http.Request, AuthIdentity)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			cfg := resolver.ConfigSnapshot()
+			if !auth.Enabled(cfg) {
+				http.NotFound(w, r)
+				return
+			}
+			if !sameOriginPost(cfg, r) {
+				http.Error(w, "Forbidden: cross-origin SOCKS credential request", http.StatusForbidden)
+				return
+			}
+			if id, ok := requireStaffAuth(cfg, w, r); ok {
+				next(cfg, w, r, *id)
+			}
+		}
+	}
+	mux.HandleFunc("POST /auth/socks/session", socksCredentialPost(func(cfg Config, w http.ResponseWriter, r *http.Request, id AuthIdentity) {
+		if !strings.HasPrefix(id.Subject, "forward:") {
+			http.NotFound(w, r)
+			return
+		}
+		if id.SessionID == "" {
+			if err := auth.startBrowserSession(cfg, w, r, id); err != nil {
+				http.Error(w, "Failed to start local SOCKS session", http.StatusInternalServerError)
+				return
+			}
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}))
+	mux.HandleFunc("POST /auth/socks", socksCredentialPost(func(cfg Config, w http.ResponseWriter, _ *http.Request, id AuthIdentity) {
+		username, password, expires, err := auth.issueSocksCredential(cfg, id)
+		switch {
+		case errors.Is(err, errBlockedSocksSubject):
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		case errors.Is(err, errInactiveSession):
+			http.Error(w, "Start a new local browser session before generating SOCKS5 credentials", http.StatusUnauthorized)
+			return
+		case err != nil:
+			http.Error(w, "Failed to generate SOCKS5 credentials", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		fmt.Fprintf(w, "SOCKS5 username: %s\nSOCKS5 password: %s\nExpires: %s\n\nCopy into FoxyProxy, then return to the status page. Do not share these credentials.\n", username, password, expires.UTC().Format(time.RFC3339))
+	}))
+	mux.HandleFunc("POST /auth/socks/revoke", socksCredentialPost(func(_ Config, w http.ResponseWriter, r *http.Request, id AuthIdentity) {
+		if !auth.revokeSocksCredential(id) {
+			http.Error(w, errInactiveSession.Error(), http.StatusUnauthorized)
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}))
+
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -250,8 +317,8 @@ func NewHTTPHandler(resolver *Resolver, socksServer *Socks5Server, configPath st
 		}
 		if id != nil {
 			data.AuthUser = id.Username
-			data.ClientIP = ClientIPFromRequest(cfg, r)
-			data.SocksToken = auth.IssueSocksToken(*id)
+			data.ForwardAuth = strings.HasPrefix(id.Subject, "forward:")
+			data.MintSession = id.SessionID != ""
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_ = statusPageTmpl.Execute(w, data)
