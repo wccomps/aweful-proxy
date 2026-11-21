@@ -115,22 +115,46 @@ func (r *Resolver) Resolve(ctx context.Context, team int, host string) (string, 
 	}
 
 	serverAddr := cfg.TeamDNSServerAddr(team)
+	slog.Debug("resolving host via team DNS",
+		"team", team,
+		"host", normalized,
+		"dns_server", serverAddr,
+	)
 	ips, dnsErr := r.queryDNS(ctx, serverAddr, normalized, cfg)
 	if dnsErr != nil {
+		slog.Debug("team DNS query failed",
+			"team", team,
+			"host", normalized,
+			"dns_server", serverAddr,
+			"err", dnsErr,
+		)
 		return "", fmt.Errorf("%w: %v", ErrHostNotFound, dnsErr)
 	}
 	if len(ips) == 0 {
+		slog.Debug("team DNS returned no A records",
+			"team", team,
+			"host", normalized,
+			"dns_server", serverAddr,
+		)
 		return "", ErrHostNotFound
 	}
 
 	for _, ip := range ips {
 		if translated, err := r.TranslateAndValidateIPv4(team, ip.String()); err == nil {
+			slog.Debug("resolved and translated host",
+				"team", team,
+				"host", normalized,
+				"dns_server", serverAddr,
+				"resolved_ip", ip.String(),
+				"translated_ip", translated,
+			)
 			return translated, nil
 		}
 	}
 	slog.Warn("DNS returned IP outside team subnet",
 		"team", team,
 		"host", normalized,
+		"dns_server", serverAddr,
 		"ips", ips,
 	)
 	return "", ErrDestinationNotAllowed

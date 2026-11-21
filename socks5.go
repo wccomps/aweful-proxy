@@ -287,7 +287,12 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 		}
 		slog.Debug("SOCKS5 host resolution failed",
 			"team", team,
+			"user", authUser,
 			"requested_host", targetHost,
+			"port", targetPort,
+			"atyp", atyp,
+			"remote", remoteStr,
+			"reply", repHostUnreachable,
 			"err", err,
 		)
 		_ = writeSocks5Reply(clientConn, repHostUnreachable)
@@ -298,13 +303,19 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 	dialer := net.Dialer{Timeout: cfg.DialTimeout()}
 	upstreamConn, err := dialer.DialContext(ctx, "tcp", destAddr)
 	if err != nil {
+		rep := classifyDialError(err)
 		slog.Debug("SOCKS5 upstream dial failed",
 			"team", team,
+			"user", authUser,
 			"requested_host", targetHost,
+			"port", targetPort,
+			"atyp", atyp,
 			"dest_addr", destAddr,
+			"remote", remoteStr,
+			"reply", rep,
 			"err", err,
 		)
-		_ = writeSocks5Reply(clientConn, classifyDialError(err))
+		_ = writeSocks5Reply(clientConn, rep)
 		return
 	}
 	if !s.trackConn(upstreamConn, true) {
