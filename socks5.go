@@ -251,7 +251,7 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 	}
 	_ = clientConn.SetDeadline(time.Now().Add(cfg.DialTimeout() + cfg.DNSTimeout()))
 
-	team, authUser, err := s.negotiateAuth(clientConn, fixedTeam, cfg, remoteStr)
+	team, authUser, err := s.negotiateAuth(clientConn, fixedTeam, cfg)
 	if err != nil {
 		slog.Debug("SOCKS5 auth failed", "fixed_team", fixedTeam, "remote", remoteStr, "err", err)
 		return
@@ -333,7 +333,7 @@ func (s *Socks5Server) handleConnection(ctx context.Context, clientConn net.Conn
 	pipeConnections(clientConn, upstreamConn, cfg.IdleTimeout())
 }
 
-func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int, cfg Config, remoteAddr string) (int, string, error) {
+func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int, cfg Config) (int, string, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return 0, "", err
@@ -347,27 +347,26 @@ func (s *Socks5Server) negotiateAuth(conn io.ReadWriter, fixedTeam int, cfg Conf
 	}
 
 	auth := s.resolver.Auth()
-	if slices.Contains(methods, methodNoAuth) && (fixedTeam > 0 || !slices.Contains(methods, methodUserPass)) {
-		if authUser, ok := CheckSocksAuth(auth, cfg, remoteAddr, "", ""); ok {
-			if _, err := conn.Write([]byte{socks5Version, methodNoAuth}); err != nil {
-				return 0, "", err
-			}
-			return fixedTeam, authUser, nil
+	if !auth.Enabled(cfg) && slices.Contains(methods, methodNoAuth) &&
+		(fixedTeam > 0 || !slices.Contains(methods, methodUserPass)) {
+		if _, err := conn.Write([]byte{socks5Version, methodNoAuth}); err != nil {
+			return 0, "", err
 		}
+		return fixedTeam, "", nil
 	}
 
 	if slices.Contains(methods, methodUserPass) {
 		if _, err := conn.Write([]byte{socks5Version, methodUserPass}); err != nil {
 			return 0, "", err
 		}
-		return s.readUserPassAuth(conn, fixedTeam, cfg, auth, remoteAddr)
+		return s.readUserPassAuth(conn, fixedTeam, cfg, auth)
 	}
 
 	_, _ = conn.Write([]byte{socks5Version, methodNoAcceptable})
 	return 0, "", errors.New("client offered no acceptable or authorized auth methods")
 }
 
-func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int, cfg Config, auth *Authenticator, remoteAddr string) (int, string, error) {
+func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int, cfg Config, auth *Authenticator) (int, string, error) {
 	verAndULen := make([]byte, 2)
 	if _, err := io.ReadFull(conn, verAndULen); err != nil {
 		return 0, "", err
@@ -396,10 +395,13 @@ func (s *Socks5Server) readUserPassAuth(conn io.ReadWriter, fixedTeam int, cfg C
 		return 0, "", err
 	}
 
-	authUser, ok := CheckSocksAuth(auth, cfg, remoteAddr, candidateUser, string(passwd))
-	if !ok {
-		_, _ = conn.Write([]byte{authVersion, 0x01})
-		return 0, "", errors.New("SOCKS5 SSO authentication failed")
+	var authUser string
+	if auth.Enabled(cfg) {
+		if !auth.verifySocksCredential(candidateUser, passwd) {
+			_, _ = conn.Write([]byte{authVersion, 0x01})
+			return 0, "", errors.New("SOCKS5 SSO authentication failed")
+		}
+		authUser = candidateUser
 	}
 
 	if _, err := conn.Write([]byte{authVersion, 0x00}); err != nil {

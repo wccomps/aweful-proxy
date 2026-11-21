@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -704,7 +705,7 @@ func TestPostConfigUpdatesResolverSocksAndFile(t *testing.T) {
 	}
 }
 
-func TestAuthentikSSOForwardAuthAndSocks5LeaseAndToken(t *testing.T) {
+func TestSSOSocksCredentialsOverTCP(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.NumberOfTeams = 2
 	cfg.InternalMask = "192.168.220."
@@ -713,135 +714,259 @@ func TestAuthentikSSOForwardAuthAndSocks5LeaseAndToken(t *testing.T) {
 	cfg.TeamDomainName = "example.com"
 	cfg.SocksListenHost = "127.0.0.1"
 	cfg.RequireSSO = true
+	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /application/o/token/":
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": r.FormValue("code")})
+		case "GET /application/o/userinfo/":
+			subject := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sub": subject, "preferred_username": "volunteer", "groups": []string{"WCComps_OrangeTeam"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer idp.Close()
+	cfg.OIDCClientID = "test-client"
+	cfg.OIDCIssuerURL = idp.URL + "/application/o/test/"
+
+	resolver, srv, basePort := startTestSocks5Server(t, context.Background(), cfg)
+	defer srv.Close()
+	auth := resolver.Auth()
+	handler := NewHTTPHandler(resolver, srv, "")
+	const origin = "http://127.0.0.1:8080"
+	sessions := make(map[string]*http.Cookie)
+	login := func(subject string) *http.Cookie {
+		t.Helper()
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, origin+"/auth/login", nil))
+		authorizeURL, err := url.Parse(w.Header().Get("Location"))
+		if w.Code != http.StatusFound || err != nil || authorizeURL.Query().Get("state") == "" {
+			t.Fatal("expected an OIDC authorization redirect")
+		}
+		q := url.Values{"code": {subject}, "state": {authorizeURL.Query().Get("state")}}
+		callback := httptest.NewRequest(http.MethodGet, origin+"/auth/callback?"+q.Encode(), nil)
+		callback.AddCookie(responseCookie(t, w, oauthCookieName))
+		w = httptest.NewRecorder()
+		handler.ServeHTTP(w, callback)
+		if w.Code != http.StatusFound {
+			t.Fatalf("OIDC callback: got status %d", w.Code)
+		}
+		return responseCookie(t, w, sessionCookieName)
+	}
+	request := func(method, path, subject, group, from string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, origin+path, nil)
+		req.RemoteAddr = "127.0.0.1:50000"
+		req.Header.Set("Origin", from)
+		if subject != "" {
+			if sessions[subject] == nil {
+				if group == "WCComps_OrangeTeam" {
+					sessions[subject] = login(subject)
+				} else {
+					w := httptest.NewRecorder()
+					err := auth.startBrowserSession(cfg, w, req, AuthIdentity{
+						Username: "volunteer", Subject: subject, Groups: []string{group},
+						ExpiresAt: time.Now().Add(time.Hour).Unix(),
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					sessions[subject] = responseCookie(t, w, sessionCookieName)
+				}
+			}
+			req.AddCookie(sessions[subject])
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	orange := func(method, path, subject string) *httptest.ResponseRecorder {
+		t.Helper()
+		return request(method, path, subject, "WCComps_OrangeTeam", origin)
+	}
+	mint := func(subject string) (string, string) {
+		t.Helper()
+		res := orange(http.MethodPost, "/auth/socks", subject)
+		if res.Code != http.StatusOK || res.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("credential issuance: status %d, cache policy %q", res.Code, res.Header().Get("Cache-Control"))
+		}
+		lines := strings.Split(res.Body.String(), "\n")
+		if len(lines) < 3 {
+			t.Fatal("missing credential response")
+		}
+		username, userOK := strings.CutPrefix(lines[0], "SOCKS5 username: ")
+		password, passOK := strings.CutPrefix(lines[1], "SOCKS5 password: ")
+		expiry, err := time.Parse(time.RFC3339, strings.TrimPrefix(lines[2], "Expires: "))
+		if !userOK || !passOK || username == "" || password == "" || err != nil ||
+			!expiry.After(time.Now()) || expiry.After(time.Now().Add(socksCredentialTTL)) {
+			t.Fatal("malformed or incorrectly scoped credential response")
+		}
+		return username, password
+	}
+	handshake := func(port int, methods []byte, wantMethod byte, username, password string, wantStatus byte) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		exchange := func(packet []byte, want [2]byte) {
+			t.Helper()
+			if _, err := conn.Write(packet); err != nil {
+				t.Fatal(err)
+			}
+			var reply [2]byte
+			if _, err := io.ReadFull(conn, reply[:]); err != nil {
+				t.Fatal(err)
+			}
+			if reply != want {
+				t.Fatalf("handshake reply %v, want %v", reply, want)
+			}
+		}
+		exchange(append([]byte{socks5Version, byte(len(methods))}, methods...), [2]byte{socks5Version, wantMethod})
+		if wantMethod == methodUserPass {
+			packet := append([]byte{authVersion, byte(len(username))}, username...)
+			packet = append(packet, byte(len(password)))
+			exchange(append(packet, password...), [2]byte{authVersion, wantStatus})
+		}
+	}
+
+	for _, tc := range []struct {
+		subject, group, from string
+		status               int
+	}{
+		{"", "", origin, http.StatusUnauthorized},
+		{"oidc:blue", "WCComps_BlueTeam", origin, http.StatusForbidden},
+		{"oidc:alice", "WCComps_OrangeTeam", "https://example.test", http.StatusForbidden},
+	} {
+		if res := request(http.MethodPost, "/auth/socks", tc.subject, tc.group, tc.from); res.Code != tc.status {
+			t.Fatalf("credential issuance: got %d, want %d", res.Code, tc.status)
+		}
+	}
+
+	user, password := mint("oidc:alice")
+	otherUser, otherPassword := mint("oidc:bob")
+	authMethods := []byte{methodNoAuth, methodUserPass}
+	handshake(basePort+1, authMethods, methodUserPass, user, password, 0)
+	handshake(basePort+1, []byte{methodNoAuth}, methodNoAcceptable, "", "", 0)
+	handshake(basePort+1, authMethods, methodUserPass, user, "", 1)
+	handshake(basePort+1, authMethods, methodUserPass, user, "wrong", 1)
+	handshake(basePort+1, authMethods, methodUserPass, otherUser, password, 1)
+	handshake(basePort, authMethods, methodUserPass, "team00+"+user, password, 0)
+	handshake(basePort+1, authMethods, methodUserPass, "team02+"+user, password, 1)
+
+	preset := orange(http.MethodGet, "/foxyproxy.json", "oidc:alice")
+	var export FoxyProxyExport
+	if preset.Code != http.StatusOK || json.Unmarshal(preset.Body.Bytes(), &export) != nil || len(export.Data) != 3 {
+		t.Fatalf("expected authenticated preset download, got status %d", preset.Code)
+	}
+	for _, entry := range export.Data {
+		if entry.Username != "" || entry.Password != "" {
+			t.Fatal("preset contains a credential")
+		}
+	}
+
+	newUser, renewed := mint("oidc:alice")
+	if user != newUser || password == renewed {
+		t.Fatal("issuing a replacement changed the identity or reused the password")
+	}
+	handshake(basePort+1, authMethods, methodUserPass, user, password, 1)
+	handshake(basePort+1, authMethods, methodUserPass, user, renewed, 0)
+	// Expire the active grant without sleeping; the next real connection must reject it.
+	auth.mu.Lock()
+	expired := auth.socksGrants[user]
+	expired.expiresAt = time.Now()
+	auth.socksGrants[user] = expired
+	auth.mu.Unlock()
+	handshake(basePort+1, authMethods, methodUserPass, user, renewed, 1)
+
+	_, password = mint("oidc:alice")
+	if res := orange(http.MethodPost, "/auth/socks/revoke", "oidc:alice"); res.Code != http.StatusSeeOther {
+		t.Fatalf("revoking credentials: got status %d", res.Code)
+	}
+	handshake(basePort+1, authMethods, methodUserPass, user, password, 1)
+	handshake(basePort+1, authMethods, methodUserPass, otherUser, otherPassword, 0)
+	if res := orange(http.MethodPost, "/auth/logout", "oidc:bob"); res.Code != http.StatusFound {
+		t.Fatalf("signing out: got status %d", res.Code)
+	}
+	handshake(basePort+1, authMethods, methodUserPass, otherUser, otherPassword, 1)
+	if res := orange(http.MethodPost, "/auth/socks", "oidc:bob"); res.Code != http.StatusUnauthorized {
+		t.Fatalf("old cookie minted after logout: got status %d", res.Code)
+	}
+	sessions["oidc:bob"] = login("oidc:bob")
+	reloginUser, reloginPassword := mint("oidc:bob")
+	handshake(basePort+1, authMethods, methodUserPass, reloginUser, reloginPassword, 0)
+
+	req := httptest.NewRequest(http.MethodGet, origin+"/healthz", nil)
+	req.RemoteAddr = "10.100.101.25:44444"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("team subnet reached management endpoint: got %d", response.Code)
+	}
+}
+
+func responseCookie(t *testing.T, w *httptest.ResponseRecorder, name string) *http.Cookie {
+	t.Helper()
+	for _, cookie := range w.Result().Cookies() {
+		if cookie.Name == name && cookie.Value != "" {
+			return cookie
+		}
+	}
+	t.Fatalf("missing %s cookie", name)
+	return nil
+}
+
+func TestForwardAuthLocalSessionRevocation(t *testing.T) {
+	cfg := DefaultConfig()
 	cfg.TrustForwardAuth = true
 	cfg.SessionSecret = "test-session-secret"
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	resolver, srv, basePort := startTestSocks5Server(t, ctx, cfg)
-	defer srv.Close()
-
-	handler := NewHTTPHandler(resolver, srv, "")
-
-	reqUnauth := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
-	reqUnauth.RemoteAddr = "127.0.0.1:50000"
-	recUnauth := httptest.NewRecorder()
-	handler.ServeHTTP(recUnauth, reqUnauth)
-	if recUnauth.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unauthenticated GET /, got %d", recUnauth.Code)
+	const origin = "https://proxy.example.test"
+	h := NewHTTPHandler(NewResolver(cfg), nil, "")
+	post := func(path, group string, cookie *http.Cookie, want int) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, origin+path, nil)
+		req.RemoteAddr = "127.0.0.1:50000"
+		req.Header.Set("Origin", origin)
+		if group != "" {
+			req.Header.Set("X-authentik-username", "volunteer")
+			req.Header.Set("X-authentik-uid", "test-subject")
+			req.Header.Set("X-authentik-groups", group)
+		}
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
+		res := httptest.NewRecorder()
+		h.ServeHTTP(res, req)
+		if res.Code != want {
+			t.Fatalf("%s: got %d, want %d", path, res.Code, want)
+		}
+		return res
 	}
+	const staff = "WCComps_OrangeTeam"
+	post("/auth/socks", staff, nil, http.StatusUnauthorized)
+	old := responseCookie(t, post("/auth/socks/session", staff, nil, http.StatusSeeOther), sessionCookieName)
+	post("/auth/socks", "", old, http.StatusUnauthorized)
+	post("/auth/socks", "WCComps_BlueTeam", old, http.StatusForbidden)
+	post("/auth/socks", staff, old, http.StatusOK)
+	post("/auth/logout", staff, old, http.StatusFound)
+	post("/auth/socks", staff, old, http.StatusUnauthorized)
 
-	reqBlue := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
-	reqBlue.RemoteAddr = "127.0.0.1:50000"
-	reqBlue.Header.Set("X-authentik-username", "team01")
-	reqBlue.Header.Set("X-authentik-groups", "WCComps_BlueTeam|WCComps_Team01")
-	recBlue := httptest.NewRecorder()
-	handler.ServeHTTP(recBlue, reqBlue)
-	if recBlue.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for Blue Team user on GET /, got %d", recBlue.Code)
-	}
-
-	connUnauth, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
-	if err != nil {
+	t.Setenv("AWEFUL_PROXY_BLOCKED_SOCKS_SUBJECTS", "forward:test-subject")
+	if err := applyEnvOverrides(&cfg); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = connUnauth.Write([]byte{0x05, 0x01, 0x00})
-	respUnauth := make([]byte, 2)
-	_, _ = io.ReadFull(connUnauth, respUnauth)
-	_ = connUnauth.Close()
-	if respUnauth[1] != methodNoAcceptable {
-		t.Fatalf("expected SOCKS5 methodNoAcceptable (0xFF) before SSO login, got 0x%02x", respUnauth[1])
-	}
-
-	reqStaff := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
-	reqStaff.RemoteAddr = "127.0.0.1:50000"
-	reqStaff.Header.Set("X-authentik-username", "alice")
-	reqStaff.Header.Set("X-authentik-groups", "WCComps_OrangeTeam")
-	recStaff := httptest.NewRecorder()
-	handler.ServeHTTP(recStaff, reqStaff)
-	if recStaff.Code != http.StatusOK {
-		t.Fatalf("expected 200 for Orange Team user on GET /, got %d", recStaff.Code)
-	}
-	if !strings.Contains(recStaff.Body.String(), "Signed in via Authentik SSO as <code>alice</code>") {
-		t.Fatalf("expected status page to display signed-in user alice")
-	}
-
-	connLeased, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = connLeased.Write([]byte{0x05, 0x01, 0x00})
-	respLeased := make([]byte, 2)
-	_, _ = io.ReadFull(connLeased, respLeased)
-	_ = connLeased.Close()
-	if respLeased[1] != methodNoAuth {
-		t.Fatalf("expected SOCKS5 methodNoAuth (0x00) after SSO login granted IP lease, got 0x%02x", respLeased[1])
-	}
-
-	reqUnauthLogout := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/auth/logout", nil)
-	reqUnauthLogout.RemoteAddr = "127.0.0.1:50000"
-	recUnauthLogout := httptest.NewRecorder()
-	handler.ServeHTTP(recUnauthLogout, reqUnauthLogout)
-	if _, ok := resolver.Auth().LookupIPLease("127.0.0.1"); !ok {
-		t.Fatalf("expected unauthenticated POST /auth/logout not to revoke active IP lease")
-	}
-
-	reqLogout := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/auth/logout", nil)
-	reqLogout.RemoteAddr = "127.0.0.1:50000"
-	reqLogout.Header.Set("X-authentik-username", "alice")
-	reqLogout.Header.Set("X-authentik-groups", "WCComps_OrangeTeam")
-	recLogout := httptest.NewRecorder()
-	handler.ServeHTTP(recLogout, reqLogout)
-	if recLogout.Code != http.StatusFound {
-		t.Fatalf("expected 302 from POST /auth/logout, got %d", recLogout.Code)
-	}
-
-	connAfterLogout, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = connAfterLogout.Write([]byte{0x05, 0x01, 0x00})
-	respAfterLogout := make([]byte, 2)
-	_, _ = io.ReadFull(connAfterLogout, respAfterLogout)
-	_ = connAfterLogout.Close()
-	if respAfterLogout[1] != methodNoAcceptable {
-		t.Fatalf("expected SOCKS5 methodNoAcceptable (0xFF) after POST /auth/logout, got 0x%02x", respAfterLogout[1])
-	}
-
-	plusUser := "alice+staff@example.com"
-	token := resolver.Auth().IssueSocksToken(AuthIdentity{
-		Username:  plusUser,
-		ExpiresAt: time.Now().Add(time.Hour).Unix(),
-	})
-
-	connToken, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", basePort+1), 500*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = connToken.Write([]byte{0x05, 0x01, 0x02})
-	respMethod := make([]byte, 2)
-	_, _ = io.ReadFull(connToken, respMethod)
-	if respMethod[1] != methodUserPass {
-		t.Fatalf("expected methodUserPass (0x02), got 0x%02x", respMethod[1])
-	}
-	authPacket := []byte{0x01, byte(len(plusUser))}
-	authPacket = append(authPacket, []byte(plusUser)...)
-	authPacket = append(authPacket, byte(len(token)))
-	authPacket = append(authPacket, []byte(token)...)
-	_, _ = connToken.Write(authPacket)
-	respAuth := make([]byte, 2)
-	_, _ = io.ReadFull(connToken, respAuth)
-	_ = connToken.Close()
-	if respAuth[1] != 0x00 {
-		t.Fatalf("expected RFC 1929 token auth success (0x00), got 0x%02x", respAuth[1])
-	}
-
-	reqTeamIP := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/healthz", nil)
-	reqTeamIP.RemoteAddr = "10.100.101.25:44444"
-	recTeamIP := httptest.NewRecorder()
-	handler.ServeHTTP(recTeamIP, reqTeamIP)
-	if recTeamIP.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for request originating from Blue Team subnet, got %d", recTeamIP.Code)
-	}
+	h = NewHTTPHandler(NewResolver(cfg), nil, "")
+	fresh := responseCookie(t, post("/auth/socks/session", staff, old, http.StatusSeeOther), sessionCookieName)
+	post("/auth/socks", staff, fresh, http.StatusForbidden)
+	cfg.blockedSocksSubjects = nil
+	h = NewHTTPHandler(NewResolver(cfg), nil, "")
+	post("/auth/socks", staff, fresh, http.StatusUnauthorized)
+	fresh = responseCookie(t, post("/auth/socks/session", staff, nil, http.StatusSeeOther), sessionCookieName)
+	post("/auth/socks", staff, fresh, http.StatusOK)
 }

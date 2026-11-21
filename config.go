@@ -62,6 +62,7 @@ type Config struct {
 	TrustedProxyCIDRs      []string      `json:"trusted_proxy_cidrs,omitempty"`
 	AllowedGroups          []string      `json:"allowed_groups,omitempty"`
 	AllowedClientCIDRs     []string      `json:"allowed_client_cidrs,omitempty"`
+	blockedSocksSubjects   []string
 }
 
 type ConfigUpdate struct {
@@ -198,6 +199,7 @@ func applyEnvOverrides(cfg *Config) error {
 		{"AWEFUL_PROXY_TRUSTED_PROXY_CIDRS", &cfg.TrustedProxyCIDRs},
 		{"AWEFUL_PROXY_ALLOWED_GROUPS", &cfg.AllowedGroups},
 		{"AWEFUL_PROXY_ALLOWED_CLIENT_CIDRS", &cfg.AllowedClientCIDRs},
+		{"AWEFUL_PROXY_BLOCKED_SOCKS_SUBJECTS", &cfg.blockedSocksSubjects},
 	}
 	for _, b := range csvBindings {
 		if v := strings.TrimSpace(os.Getenv(b.env)); v != "" {
@@ -208,6 +210,12 @@ func applyEnvOverrides(cfg *Config) error {
 				}
 			}
 			*b.target = items
+		}
+	}
+	for _, subject := range cfg.blockedSocksSubjects {
+		kind, value, ok := strings.Cut(subject, ":")
+		if !ok || (kind != "oidc" && kind != "forward") || strings.TrimSpace(value) == "" {
+			return errors.New("AWEFUL_PROXY_BLOCKED_SOCKS_SUBJECTS entries must be oidc:<sub> or forward:<uid>")
 		}
 	}
 

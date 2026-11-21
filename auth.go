@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,13 +20,16 @@ import (
 )
 
 const (
-	sessionCookieName = "aweful_session"
-	oauthCookieName   = "aweful_oauth_state"
-	oauthStateTTL     = 5 * time.Minute
-	defaultSessionTTL = 12 * time.Hour
+	sessionCookieName  = "aweful_session"
+	oauthCookieName    = "aweful_oauth_state"
+	oauthStateTTL      = 5 * time.Minute
+	defaultSessionTTL  = 12 * time.Hour
+	socksCredentialTTL = 15 * time.Minute
 )
 
 var errForbiddenGroup = errors.New("user does not belong to an authorized staff group")
+var errInactiveSession = errors.New("no active browser session")
+var errBlockedSocksSubject = errors.New("SOCKS5 credential issuance is blocked for this account")
 
 var defaultStaffGroups = []string{
 	"WCComps_Discord_Admin",
@@ -50,11 +52,14 @@ type AuthIdentity struct {
 	Username  string   `json:"u"`
 	Groups    []string `json:"g"`
 	ExpiresAt int64    `json:"exp"`
+	Subject   string   `json:"sub"`
+	SessionID string   `json:"sid"`
 }
 
-type ipLease struct {
-	username  string
-	expiresAt time.Time
+type socksGrant struct {
+	passwordHash [sha256.Size]byte
+	sessionID    string
+	expiresAt    time.Time
 }
 
 type oauthStatePayload struct {
@@ -65,10 +70,11 @@ type oauthStatePayload struct {
 }
 
 type Authenticator struct {
-	mu         sync.RWMutex
-	secret     []byte
-	leases     map[string]ipLease
-	httpClient *http.Client
+	mu          sync.RWMutex
+	secret      []byte
+	sessions    map[string]int64
+	socksGrants map[string]socksGrant
+	httpClient  *http.Client
 }
 
 func NewAuthenticator(secretStr string) *Authenticator {
@@ -81,8 +87,9 @@ func NewAuthenticator(secretStr string) *Authenticator {
 		_, _ = rand.Read(secret)
 	}
 	return &Authenticator{
-		secret: secret,
-		leases: make(map[string]ipLease),
+		secret:      secret,
+		sessions:    make(map[string]int64),
+		socksGrants: make(map[string]socksGrant),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -93,74 +100,107 @@ func (a *Authenticator) Enabled(cfg Config) bool {
 	return cfg.RequireSSO || cfg.OIDCClientID != "" || cfg.TrustForwardAuth
 }
 
-func (a *Authenticator) AuthorizeIP(ipStr string, id AuthIdentity) {
-	host := normalizeIPString(ipStr)
-	if host == "" {
-		return
+// socksUsername is stable across sessions and distinct from team routing names.
+func (id AuthIdentity) socksUsername() string {
+	hash := sha256.Sum256([]byte(id.Subject))
+	return "staff-" + base64.RawURLEncoding.EncodeToString(hash[:])
+}
+
+func (a *Authenticator) startBrowserSession(cfg Config, w http.ResponseWriter, r *http.Request, id AuthIdentity) error {
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
 	}
+	id.SessionID = base64.RawURLEncoding.EncodeToString(nonce[:])
+	signed, err := a.signJSON(id)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	now := time.Now().Unix()
+	for sid, expiry := range a.sessions {
+		if now >= expiry {
+			delete(a.sessions, sid)
+		}
+	}
+	a.sessions[id.SessionID] = id.ExpiresAt
+	a.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookieName, Value: signed, Path: "/",
+		MaxAge: int(id.ExpiresAt - now), HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, Secure: isHTTPSRequest(cfg, r),
+	})
+	return nil
+}
+
+func (a *Authenticator) browserSession(r *http.Request) (*AuthIdentity, error) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return nil, errInactiveSession
+	}
+	var id AuthIdentity
+	if err := a.verifyJSON(cookie.Value, &id); err != nil {
+		return nil, err
+	}
+	a.mu.RLock()
+	active := a.sessions[id.SessionID] > time.Now().Unix()
+	a.mu.RUnlock()
+	if !active {
+		return nil, errInactiveSession
+	}
+	return &id, nil
+}
+
+// The session check and grant write share the logout lock. A request that
+// authenticated before logout cannot mint a credential after it.
+func (a *Authenticator) issueSocksCredential(cfg Config, id AuthIdentity) (string, string, time.Time, error) {
+	if slices.Contains(cfg.blockedSocksSubjects, id.Subject) {
+		return "", "", time.Time{}, errBlockedSocksSubject
+	}
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		return "", "", time.Time{}, err
+	}
+	password := base64.RawURLEncoding.EncodeToString(secret[:])
+	username := id.socksUsername()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
-	for k, v := range a.leases {
-		if now.After(v.expiresAt) {
-			delete(a.leases, k)
+	expires := time.Unix(id.ExpiresAt, 0)
+	if limit := now.Add(socksCredentialTTL); limit.Before(expires) {
+		expires = limit
+	}
+	if a.sessions[id.SessionID] <= now.Unix() || !now.Before(expires) {
+		return "", "", time.Time{}, errInactiveSession
+	}
+	for user, grant := range a.socksGrants {
+		if !now.Before(grant.expiresAt) {
+			delete(a.socksGrants, user)
 		}
 	}
-	a.leases[host] = ipLease{
-		username:  id.Username,
-		expiresAt: time.Unix(id.ExpiresAt, 0),
+	a.socksGrants[username] = socksGrant{
+		passwordHash: sha256.Sum256([]byte(password)), sessionID: id.SessionID, expiresAt: expires,
 	}
+	return username, password, expires, nil
 }
 
-func (a *Authenticator) RevokeIP(ipStr string) {
-	host := normalizeIPString(ipStr)
-	if host == "" {
-		return
-	}
+func (a *Authenticator) revokeSocksCredential(id AuthIdentity) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	delete(a.leases, host)
+	if a.sessions[id.SessionID] <= time.Now().Unix() {
+		return false
+	}
+	delete(a.socksGrants, id.socksUsername())
+	return true
 }
 
-func (a *Authenticator) LookupIPLease(ipStr string) (string, bool) {
-	host := normalizeIPString(ipStr)
-	if host == "" {
-		return "", false
-	}
+func (a *Authenticator) verifySocksCredential(username string, password []byte) bool {
+	hash := sha256.Sum256(password)
 	a.mu.RLock()
-	lease, ok := a.leases[host]
-	a.mu.RUnlock()
-	if !ok || time.Now().After(lease.expiresAt) {
-		return "", false
-	}
-	return lease.username, true
-}
-
-func (a *Authenticator) IssueSocksToken(id AuthIdentity) string {
-	payload := fmt.Sprintf("socks:%s:%d", id.Username, id.ExpiresAt)
-	mac := hmac.New(sha256.New, a.secret)
-	_, _ = mac.Write([]byte(payload))
-	sig := hex.EncodeToString(mac.Sum(nil)[:16])
-	return fmt.Sprintf("%d.%s", id.ExpiresAt, sig)
-}
-
-func (a *Authenticator) VerifySocksToken(username, token string) bool {
-	if username == "" || token == "" {
-		return false
-	}
-	expStr, sig, ok := strings.Cut(token, ".")
-	if !ok || expStr == "" || sig == "" {
-		return false
-	}
-	var exp int64
-	if _, err := fmt.Sscanf(expStr, "%d", &exp); err != nil {
-		return false
-	}
-	if time.Now().Unix() > exp {
-		return false
-	}
-	expected := a.IssueSocksToken(AuthIdentity{Username: username, ExpiresAt: exp})
-	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+	defer a.mu.RUnlock()
+	grant, ok := a.socksGrants[username]
+	return ok && time.Now().Before(grant.expiresAt) &&
+		subtle.ConstantTimeCompare(hash[:], grant.passwordHash[:]) == 1
 }
 
 func (a *Authenticator) signJSON(v interface{}) (string, error) {
@@ -200,32 +240,34 @@ func (a *Authenticator) AuthenticateRequest(cfg Config, r *http.Request) (*AuthI
 			if !hasAllowedGroup(cfg, groups) {
 				return nil, fmt.Errorf("%w: %q", errForbiddenGroup, user)
 			}
+			uid := strings.TrimSpace(r.Header.Get("X-authentik-uid"))
+			if uid == "" {
+				return nil, errors.New("missing forwarded Authentik user ID")
+			}
 			id := &AuthIdentity{
 				Username:  user,
 				Groups:    groups,
 				ExpiresAt: time.Now().Add(cfg.SessionTTL()).Unix(),
+				Subject:   "forward:" + uid,
 			}
-			a.AuthorizeIP(ClientIPFromRequest(cfg, r), *id)
+			if session, err := a.browserSession(r); err == nil && session.Subject == id.Subject {
+				id.SessionID, id.ExpiresAt = session.SessionID, session.ExpiresAt
+			}
 			return id, nil
 		}
 	}
 
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil || cookie.Value == "" {
-		return nil, errors.New("unauthenticated")
-	}
-	var id AuthIdentity
-	if err := a.verifyJSON(cookie.Value, &id); err != nil {
+	id, err := a.browserSession(r)
+	if err != nil {
 		return nil, err
 	}
-	if time.Now().Unix() > id.ExpiresAt {
-		return nil, errors.New("session expired")
+	if strings.HasPrefix(id.Subject, "forward:") {
+		return nil, errInactiveSession
 	}
 	if !hasAllowedGroup(cfg, id.Groups) {
 		return nil, fmt.Errorf("%w: %q", errForbiddenGroup, id.Username)
 	}
-	a.AuthorizeIP(ClientIPFromRequest(cfg, r), id)
-	return &id, nil
+	return id, nil
 }
 
 func (a *Authenticator) HandleLogin(cfg Config, w http.ResponseWriter, r *http.Request) {
@@ -402,23 +444,12 @@ func (a *Authenticator) HandleCallback(cfg Config, w http.ResponseWriter, r *htt
 		Username:  username,
 		Groups:    claims.Groups,
 		ExpiresAt: time.Now().Add(cfg.SessionTTL()).Unix(),
+		Subject:   "oidc:" + claims.Sub,
 	}
-	signedSession, err := a.signJSON(id)
-	if err != nil {
-		http.Error(w, "Failed to sign session", http.StatusInternalServerError)
+	if err := a.startBrowserSession(cfg, w, r, id); err != nil {
+		http.Error(w, "Failed to start session", http.StatusInternalServerError)
 		return
 	}
-	a.AuthorizeIP(ClientIPFromRequest(cfg, r), id)
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    signedSession,
-		Path:     "/",
-		MaxAge:   int(cfg.SessionTTL().Seconds()),
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   isHTTPSRequest(cfg, r),
-	})
 
 	next := stateObj.Next
 	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
@@ -428,13 +459,18 @@ func (a *Authenticator) HandleCallback(cfg Config, w http.ResponseWriter, r *htt
 }
 
 func (a *Authenticator) HandleLogout(cfg Config, w http.ResponseWriter, r *http.Request) {
-	secFetch := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
-	if secFetch != "" && secFetch != "same-origin" && secFetch != "none" {
+	if !sameOriginPost(cfg, r) {
 		http.Error(w, "Forbidden: cross-origin logout rejected", http.StatusForbidden)
 		return
 	}
-	if _, err := a.AuthenticateRequest(cfg, r); err == nil {
-		a.RevokeIP(ClientIPFromRequest(cfg, r))
+	if id, err := a.browserSession(r); err == nil {
+		a.mu.Lock()
+		delete(a.sessions, id.SessionID)
+		user := id.socksUsername()
+		if a.socksGrants[user].sessionID == id.SessionID {
+			delete(a.socksGrants, user)
+		}
+		a.mu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
@@ -443,8 +479,19 @@ func (a *Authenticator) HandleLogout(cfg Config, w http.ResponseWriter, r *http.
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   isHTTPSRequest(cfg, r),
 	})
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func sameOriginPost(cfg Config, r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		return false
+	}
+	origin := strings.TrimSuffix(buildCallbackURL(cfg, r), "/auth/callback")
+	return r.Header.Get("Origin") == origin
 }
 
 func oidcEndpoints(issuerURL string) (authURL, tokenURL, userinfoURL string, err error) {
@@ -610,19 +657,4 @@ func overlapsLocalInterfaceSubnet(ip net.IP) bool {
 		}
 	}
 	return false
-}
-
-func CheckSocksAuth(auth *Authenticator, cfg Config, clientAddr string, username, password string) (string, bool) {
-	if auth == nil || !auth.Enabled(cfg) {
-		return "", true
-	}
-	if username != "" && password != "" {
-		if auth.VerifySocksToken(username, password) {
-			return username, true
-		}
-	}
-	if leasedUser, ok := auth.LookupIPLease(clientAddr); ok {
-		return leasedUser, true
-	}
-	return "", false
 }
