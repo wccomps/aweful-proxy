@@ -28,7 +28,7 @@ func envDebugEnabled() bool {
 
 func main() {
 	configPath := flag.String("config", "/etc/aweful-proxy/config.json", "Path to aweful-proxy JSON configuration file")
-	debug := flag.Bool("debug", false, "Enable debug logging (also AWEFUL_PROXY_DEBUG=true/false/1/0)")
+	debug := flag.Bool("debug", false, "Enable debug logging (also available via AWEFUL_PROXY_DEBUG)")
 	flag.Parse()
 
 	logLevel := slog.LevelInfo
