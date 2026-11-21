@@ -14,9 +14,6 @@ import (
 	"time"
 )
 
-// envDebugEnabled reports whether AWEFUL_PROXY_DEBUG requests debug logging.
-// Accepts the strconv.ParseBool set (true/false, 1/0, t/f, yes/no is not
-// included); an unset or unparseable value leaves debug off.
 func envDebugEnabled() bool {
 	v, ok := os.LookupEnv("AWEFUL_PROXY_DEBUG")
 	if !ok {
